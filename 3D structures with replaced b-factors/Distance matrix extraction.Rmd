@@ -1,0 +1,421 @@
+---
+title: "DISTANCE MATRIX MAKER"
+author: "RC"
+date: "2023-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+```
+
+This script allows for obtaining distance matrices from pdb files, and fixing the names for the format A.HA.001.MET.
+
+To get not just the default PDB but all chains go to on the PDB page -> Download Files -> Biological Assembly 1 (PDB - gz)
+
+Notes: To make this run for all pdbs not much has to be changed:
+  Check names/paths
+  Check valid chains to keep
+  Check starting positions for each chain (see which aminoacid each chain starts in to properly assign aminoacid position    and names)
+
+The last option "No threshold" is the best for centroids.
+
+```{r}
+python_path <- normalizePath("C:/Users/rsk/AppData/Local/Programs/Python/Python312/python.exe")
+reticulate::use_python(python_path)
+```
+
+
+```{r}
+# Install necessary Python packages
+reticulate::py_install(c("biopython", "numpy", "pandas"))
+
+```
+
+
+```{python}
+# Install necessary Python packages
+!pip install biopython numpy pandas
+
+```
+
+###MAKE DISTANCE MATRIX####
+
+Try to get distance matrix for pdb
+```{python}
+# Import necessary libraries
+from Bio.PDB import PDBParser
+import numpy as np
+import pandas as pd
+
+# Define the calculate_distance_matrix function
+def calculate_distance_matrix(structure):
+    atom_list = list(structure.get_atoms())
+    num_atoms = len(atom_list)
+    distance_matrix = np.zeros((num_atoms, num_atoms))
+
+    for i in range(num_atoms):
+        for j in range(i + 1, num_atoms):
+            distance_matrix[i, j] = distance_matrix[j, i] = atom_list[i] - atom_list[j]
+
+    return distance_matrix
+
+# Define the main function
+def main(pdb_filename, output_csv):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_filename)
+
+    distance_matrix = calculate_distance_matrix(structure)
+
+    # Convert the distance matrix to a Pandas DataFrame
+    df_distance_matrix = pd.DataFrame(distance_matrix)
+
+    # Save the DataFrame to a CSV file
+    df_distance_matrix.to_csv(output_csv, index=False)
+
+# Specify the PDB filename and the output CSV filename
+pdb_filename = "4oph.pdb"
+output_csv = "distance_matrix_NS1.csv"
+
+main(pdb_filename, output_csv)
+
+```
+
+Try below 50 angstrom, with info on residue:
+```{python}
+# Import necessary libraries
+from Bio.PDB import PDBParser
+import numpy as np
+import pandas as pd
+
+# Define the calculate_distance_matrix function
+def calculate_distance_matrix(structure):
+    atom_list = list(structure.get_atoms())
+    num_atoms = len(atom_list)
+    distance_matrix = np.zeros((num_atoms, num_atoms))
+
+    for i in range(num_atoms):
+        for j in range(i + 1, num_atoms):
+            distance = atom_list[i] - atom_list[j]
+
+            # Filter distances below 50 Angstroms
+            if distance < 50:
+                distance_matrix[i, j] = distance_matrix[j, i] = distance
+
+    return distance_matrix
+
+# Define the main function
+def main(pdb_filename, output_csv):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_filename)
+
+    distance_matrix = calculate_distance_matrix(structure)
+
+    # Extract information for row and column names
+    names = [
+        f"{atom.get_full_id()[2]}_{structure.id}_{atom.get_full_id()[3][1]:03d}_{atom.get_parent().get_resname()}"
+        for atom in structure.get_atoms()
+    ]
+
+    # Convert the distance matrix to a Pandas DataFrame with modified names
+    df_distance_matrix = pd.DataFrame(distance_matrix, index=names, columns=names)
+
+    # Save the DataFrame to a CSV file
+    df_distance_matrix.to_csv(output_csv)
+
+# Specify the PDB filename and the output CSV filename
+pdb_filename = "6nhq.pdb"
+output_csv = "distance_matrix_6nhq.csv"
+
+# Call the main function
+main(pdb_filename, output_csv)
+
+```
+
+And with centroids (may mess up names)
+```{python}
+# Import necessary libraries
+from Bio.PDB import PDBParser
+import numpy as np
+import pandas as pd
+
+# Define the calculate_centroid_distances function
+def calculate_centroid_distances(structure):
+    # Dictionary to store centroid coordinates for each residue
+    centroids = {}
+
+    # Iterate through all residues
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                # Calculate centroid coordinates as the average of all atom coordinates in the residue
+                centroid = np.mean([atom.get_coord() for atom in residue], axis=0)
+                # Extract relevant information for the key
+                chain_id = chain.id
+                residue_number = residue.id[1]
+                residue_name = residue.get_resname()
+                key = (chain_id, model.id, residue_number, residue_name)
+                centroids[key] = centroid
+
+    # Calculate distances between centroids
+    num_residues = len(centroids)
+    centroid_distances = np.zeros((num_residues, num_residues))
+
+    keys = list(centroids.keys())
+
+    for i in range(num_residues):
+        for j in range(i + 1, num_residues):
+            distance = np.linalg.norm(centroids[keys[i]] - centroids[keys[j]])
+            centroid_distances[i, j] = centroid_distances[j, i] = distance
+
+    return centroids, centroid_distances
+
+# Define the main function
+def main(pdb_filename, output_csv):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_filename)
+
+    centroids, centroid_distances = calculate_centroid_distances(structure)
+
+    # Convert the centroid distance matrix to a Pandas DataFrame with modified names
+    names = [f"{key[0]}_{structure.id}_{key[2]:03d}_{key[3]}" for key in centroids.keys()]
+    df_centroid_distances = pd.DataFrame(centroid_distances, index=names, columns=names)
+
+    # Save the DataFrame to a CSV file
+    df_centroid_distances.to_csv(output_csv)
+
+
+# Specify the PDB filename and the output CSV filename
+pdb_filename = "6nhq.pdb"
+output_csv = "distance_matrix_6nhq.csv"
+
+# Call the main function
+main(pdb_filename, output_csv)
+
+```
+
+Below 50A, Correct to not put zeroes when it's above 50 A (it's empty instead)
+
+```{python}
+# Import necessary libraries
+from Bio.PDB import PDBParser
+import numpy as np
+import pandas as pd
+
+# Define the calculate_centroid_distances function
+def calculate_centroid_distances(structure, distance_threshold=50):
+    # Dictionary to store centroid coordinates for each residue
+    centroids = {}
+
+    # Iterate through all residues
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                # Calculate centroid coordinates as the average of all atom coordinates in the residue
+                centroid = np.mean([atom.get_coord() for atom in residue], axis=0)
+                # Extract relevant information for the key
+                chain_id = chain.id
+                residue_number = residue.id[1]
+                residue_name = residue.get_resname()
+                key = (chain_id, model.id, residue_number, residue_name)
+                centroids[key] = centroid
+
+    # Calculate distances between centroids
+    num_residues = len(centroids)
+    centroid_distances = np.zeros((num_residues, num_residues))  # Initialize with zeros
+
+    keys = list(centroids.keys())
+
+    for i in range(num_residues):
+        for j in range(i + 1, num_residues):
+            distance = np.linalg.norm(centroids[keys[i]] - centroids[keys[j]])
+
+            # Check if the distance is above the threshold
+            if distance > distance_threshold:
+                centroid_distances[i, j] = centroid_distances[j, i] = np.nan
+            else:
+                centroid_distances[i, j] = centroid_distances[j, i] = distance
+
+    return centroids, centroid_distances
+
+
+# Define the main function
+def main(pdb_filename, output_csv):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_filename)
+
+    centroids, centroid_distances = calculate_centroid_distances(structure)
+
+    # Convert the centroid distance matrix to a Pandas DataFrame with modified names
+    names = [f"{key[0]}_{structure.id}_{key[2]:03d}_{key[3]}" for key in centroids.keys()]
+    df_centroid_distances = pd.DataFrame(centroid_distances, index=names, columns=names)
+
+    # Save the DataFrame to a CSV file
+    df_centroid_distances.to_csv(output_csv)
+
+# Specify the PDB filename and the output CSV filename
+pdb_filename = "4oph1.pdb"
+output_csv = "distance_matrix_NS1b.csv"
+
+# Call the main function
+main(pdb_filename, output_csv)
+
+```
+
+No threshold (Centroids)
+```{python}
+# Import necessary libraries
+from Bio.PDB import PDBParser
+import numpy as np
+import pandas as pd
+
+# Define the calculate_centroid_distances function
+def calculate_centroid_distances(structure):
+    # Dictionary to store centroid coordinates for each residue
+    centroids = {}
+
+    # Iterate through all residues
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                # Calculate centroid coordinates as the average of all atom coordinates in the residue
+                centroid = np.mean([atom.get_coord() for atom in residue], axis=0)
+                # Extract relevant information for the key
+                chain_id = chain.id
+                residue_number = residue.id[1]
+                residue_name = residue.get_resname()
+                key = (chain_id, model.id, residue_number, residue_name)
+                centroids[key] = centroid
+
+    # Calculate distances between centroids
+    num_residues = len(centroids)
+    centroid_distances = np.zeros((num_residues, num_residues))
+
+    keys = list(centroids.keys())
+
+    for i in range(num_residues):
+        for j in range(i + 1, num_residues):
+            distance = np.linalg.norm(centroids[keys[i]] - centroids[keys[j]])
+            centroid_distances[i, j] = centroid_distances[j, i] = distance
+
+    return centroids, centroid_distances
+
+# Define the main function
+def main(pdb_filename, output_csv):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_filename)
+
+    centroids, centroid_distances = calculate_centroid_distances(structure)
+
+    # Convert the centroid distance matrix to a Pandas DataFrame with modified names
+    names = [f"{key[0]}_{structure.id}_{key[2]:03d}_{key[3]}" for key in centroids.keys()]
+    df_centroid_distances = pd.DataFrame(centroid_distances, index=names, columns=names)
+
+    # Save the DataFrame to a CSV file
+    df_centroid_distances.to_csv(output_csv)
+
+# Specify the PDB filename and the output CSV filename
+pdb_filename = "6qnw.pdb"
+output_csv = "distance_matrix_6QNW.csv"
+
+# Call the main function
+main(pdb_filename, output_csv)
+
+```
+
+
+####FIX NAMES###
+
+This fixes naming format if I need to shift numbering. 
+
+BUT BEFORE MUST FIX CSV TO MAKE SURE THE CHAINS HAVE THE RIGHT NAMES (go to excel and just rename series of aminoacids appropriately)
+
+Remember to add "Residue" to the empty cell at the end.
+
+___NOTICE: I modified the HA distance matrix to conform to the uncleaved numbering (G234W instead of G218W). Alternatively the original numbering can be maintained here but then it has to be changed in the column names of the ancestral/derived counts file. Either way works___
+
+
+```{r}
+# Assuming your data frame is named 'df'
+df <- read.csv("distance_matrix_6QNW.csv", row.names = 1)
+
+# SELECT CHAINS TO KEEP: Define a vector of valid chain identifiers (A-F)
+
+valid_chains <- c("A", "B", "C", "D", "E", "F")
+
+# 1: Delete rows and columns that don't start with A-F
+df <- df[grepl("^(A|B|C|D|E|F)_", rownames(df)) & grepl("^(A|B|C|D|E|F)_", colnames(df)), ]
+
+# 2: Define starting positions for each chain
+starting_positions <- c(A = 1, B = 1)
+
+# 3: Update row and column names
+for (chain in valid_chains) {
+  chain_rows <- grepl(paste0("^", chain, "_"), rownames(df))
+  chain_cols <- grepl(paste0("^", chain, "_"), colnames(df))
+  
+  if (any(chain_rows) && any(chain_cols)) {
+    starting_position <- starting_positions[chain]
+    
+    # Generate new names with updated numbering and the original amino acid names
+    new_row_numbers <- starting_position + seq_len(sum(chain_rows)) - 1
+    new_row_names <- paste0(chain, "_NS1_", sprintf("%03d", new_row_numbers), "_", substring(rownames(df)[chain_rows], nchar(rownames(df)[chain_rows])-2))
+    
+    new_col_numbers <- starting_position + seq_len(sum(chain_cols)) - 1
+    new_col_names <- paste0(chain, "_NS1_", sprintf("%03d", new_col_numbers), "_", substring(colnames(df)[chain_cols], nchar(colnames(df)[chain_cols])-2))
+    
+    rownames(df)[chain_rows] <- new_row_names
+    colnames(df)[chain_cols] <- new_col_names
+  }
+}
+
+#Change separators into periods.
+# Replace all underscores with dots in row and column names
+rownames(df) <- gsub("_", ".", rownames(df))
+colnames(df) <- gsub("_", ".", colnames(df))
+
+
+# 4: Delete rows and columns containing "HOH" or "NAG"
+rows_to_delete <- grepl("HOH|NAG", rownames(df))
+cols_to_delete <- grepl("HOH|NAG", colnames(df))
+
+# Exclude rows and columns with names containing "HOH" or "NAG"
+df2 <- df[!rows_to_delete, !cols_to_delete]
+
+# 5: Save the updated dataframe to a new CSV file
+write.csv(df2, "6QNW-dm-nolimit.csv")
+
+```
+
+
+Without renumbering
+```{r}
+# Assuming your data frame is named 'df'
+df <- read.csv("distance_matrix_6QNW.csv", row.names = 1)
+
+# SELECT CHAINS TO KEEP: Define a vector of valid chain identifiers (A-F)
+
+valid_chains <- c("A", "B", "C", "D", "E", "F")
+
+# 1: Delete rows and columns that don't start with A-F
+df <- df[grepl("^(A|B|C|D|E|F)_", rownames(df)) & grepl("^(A|B|C|D|E|F)_", colnames(df)), ]
+
+#Change separators into periods.
+# Replace all underscores with dots in row and column names
+rownames(df) <- gsub("_", ".", rownames(df))
+colnames(df) <- gsub("_", ".", colnames(df))
+
+
+# 4: Delete rows and columns containing "HOH" or "NAG"
+rows_to_delete <- grepl("HOH|NAG", rownames(df))
+cols_to_delete <- grepl("HOH|NAG", colnames(df))
+
+# Exclude rows and columns with names containing "HOH" or "NAG"
+df2 <- df[!rows_to_delete, !cols_to_delete]
+
+# 5: Save the updated dataframe to a new CSV file
+write.csv(df2, "6QNW-dm-nolimit.csv")
+
+```
+
