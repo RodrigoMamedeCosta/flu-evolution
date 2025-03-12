@@ -23,7 +23,8 @@ This repository contains **R scripts and datasets** required for reproducing the
 ## **Installation & Requirements**
 Ensure you have **R 4.0+** installed. Required packages are included in scripts.
 
-## Licensed under the **MIT License**
+##  **Copyright 2025 Rodrigo Costa**
+##  Licensed under the Apache License, Version 2.0
 
 ## **Citation**
 If you use these scripts in your research, please cite:
