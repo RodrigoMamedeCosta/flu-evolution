@@ -5,7 +5,7 @@ This repository contains all **R scripts and datasets** required for reproducing
 
 > **Costa RM, Acosta-Alvarez L, Curtis K, Zarbock K, Kelleher J, et al.**  
 > *Influenza virus evolution and defective genome formation are shaped by host genotype and sex* (2025).  
-> [10.1101/2025.02.26.638946v1]
+> [[10.1101/2025.02.26.638946v1](https://www.biorxiv.org/content/10.1101/2025.02.26.638946v1)]
 
 Scripts are present for:
 - **Rolling sphere** for detection of positively selected mutations hotspots
