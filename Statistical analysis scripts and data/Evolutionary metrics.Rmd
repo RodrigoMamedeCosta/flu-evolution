@@ -1,0 +1,108 @@
+---
+title: "Evolutionary metrics"
+author: "RC"
+date: "2024-12-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load required libraries
+library(dplyr)
+```
+
+
+```{r setup, include=FALSE}
+# Load data
+data <- read.csv("Frequencies by lineage - All sites.csv", header = TRUE)
+```
+
+
+```{r setup, include=FALSE}
+# Extract frequency columns (assuming metadata is in the first few columns)
+metadata_columns <- 4 # Adjust based on your dataset structure
+freq_data <- data[, (metadata_columns + 1):ncol(data)]
+
+# Transpose frequency data for easier computation
+freq_matrix <- as.matrix(freq_data)
+
+# Compute Gene Diversity (Expected Heterozygosity) for each sample
+gene_diversity <- colMeans(2 * freq_matrix * (1 - freq_matrix), na.rm = TRUE)
+gene_diversity_df <- data.frame(Sample = colnames(freq_matrix), GeneDiversity = gene_diversity)
+
+# Function to calculate Nei's Genetic Distance
+nei_distance <- function(freq1, freq2) {
+  1 - sum(sqrt(freq1 * freq2), na.rm = TRUE) / sqrt(sum(freq1, na.rm = TRUE) * sum(freq2, na.rm = TRUE))
+}
+
+# Compute Nei's Genetic Distance matrix
+sample_names <- colnames(freq_matrix)
+nei_dist_matrix <- matrix(0, ncol = ncol(freq_matrix), nrow = ncol(freq_matrix))
+colnames(nei_dist_matrix) <- sample_names
+rownames(nei_dist_matrix) <- sample_names
+
+for (i in 1:(ncol(freq_matrix) - 1)) {
+  for (j in (i + 1):ncol(freq_matrix)) {
+    nei_dist_matrix[i, j] <- nei_distance(freq_matrix[, i], freq_matrix[, j])
+    nei_dist_matrix[j, i] <- nei_dist_matrix[i, j]
+  }
+}
+
+# Save results
+write.csv(gene_diversity_df, "Gene_Diversity.csv", row.names = FALSE)
+write.csv(as.data.frame(nei_dist_matrix), "Nei_Genetic_Distance.csv", row.names = TRUE)
+
+# Print summary
+print("Gene diversity and Nei's genetic distance calculated successfully.")
+
+```
+
+```{r}
+# Load required libraries
+library(dplyr)
+
+# Read the dataset
+data <- read.csv("Frequencies by lineage - All sites.csv", check.names = FALSE)
+
+# Identify metadata columns (adjust this if necessary)
+metadata_columns <- 4 # Assuming metadata spans up to column 5
+freq_data <- data[, (metadata_columns + 1):ncol(data)] # Extract frequency columns
+
+# Extract sample names
+sample_names <- colnames(freq_data)
+
+# Define Nei's genetic distance function
+nei_distance <- function(freq1, freq2) {
+  # Ensure comparison only for positions with non-missing values in both samples
+  valid_positions <- !is.na(freq1) & !is.na(freq2)
+  freq1 <- freq1[valid_positions]
+  freq2 <- freq2[valid_positions]
+  
+  # Calculate Nei's genetic distance
+  numerator <- sum((freq1 - freq2)^2, na.rm = TRUE)
+  denominator <- sum(freq1 + freq2, na.rm = TRUE)
+  if (denominator == 0) return(NA) # Handle cases with no valid data
+  return(numerator / denominator)
+}
+
+# Initialize Nei's distance matrix
+n_samples <- ncol(freq_data)
+nei_dist_matrix <- matrix(NA, nrow = n_samples, ncol = n_samples,
+                          dimnames = list(sample_names, sample_names))
+
+# Calculate pairwise Nei's genetic distances
+for (i in 1:(n_samples - 1)) {
+  for (j in (i + 1):n_samples) {
+    nei_dist_matrix[i, j] <- nei_distance(freq_data[, i], freq_data[, j])
+    nei_dist_matrix[j, i] <- nei_dist_matrix[i, j] # Symmetric matrix
+  }
+}
+
+# Save the results
+write.csv(as.data.frame(nei_dist_matrix), "Nei_Genetic_Distance_Adapted.csv", row.names = TRUE)
+
+# Output success message
+print("Nei's genetic distance matrix calculated and saved.")
+
+```
+

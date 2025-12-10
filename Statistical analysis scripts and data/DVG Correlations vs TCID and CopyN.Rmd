@@ -1,0 +1,414 @@
+---
+title: "Titers KW and Dunn's"
+author: "RC"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(MASS)
+```
+
+
+```{r}
+###############################################
+## 0. Load sample metrics
+###############################################
+
+if (!exists("sample_metrics_full")) {
+  data <- read.csv("Outputs/dvg_sample_metrics.csv", sep = ",", header = TRUE)
+} else {
+  data <- sample_metrics_full
+}
+
+# Ensure numeric types
+data <- data %>%
+  mutate(
+    TCID50 = as.numeric(TCID50),
+    Copy.Number = as.numeric(Copy.Number),
+    DVG_count = as.numeric(DVG_count),
+    mean_length = as.numeric(mean_length),
+    BP_entropy = as.numeric(BP_entropy),
+    total_support = as.numeric(total_support),
+    Host = as.factor(Host)
+  )
+
+
+# Log transforms for y variables
+data <- data %>%
+  mutate(
+    log10_TCID50 = log10(TCID50),
+    log10_CopyNumber = log10(Copy.Number)
+  )
+
+# Pseudocount for count so log scale works if any zeros
+rich_pseudo <- 0.3
+data <- data %>%
+  mutate(
+    DVG_count_plot = ifelse(DVG_count <= 0, rich_pseudo, DVG_count),
+    log10_DVG_count_plot = log10(DVG_count_plot)
+  )
+
+###############################################
+## 1. Spearman correlations (overall)
+###############################################
+
+corr_fun <- function(x, y) {
+  ok <- complete.cases(x, y)
+  ct <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman", exact = FALSE))
+  list(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+
+metrics <- c("DVG_count", "mean_length", "BP_entropy")
+yvars   <- c("TCID50", "Copy.Number")
+
+corr_results <- expand.grid(
+  Measure = metrics,
+  Outcome = yvars,
+  stringsAsFactors = FALSE
+)
+
+corr_results <- corr_results %>%
+  mutate(
+    rho       = mapply(function(m, y) corr_fun(data[[m]], data[[y]])$rho,
+                       Measure, Outcome),
+    p_value   = mapply(function(m, y) corr_fun(data[[m]], data[[y]])$p,
+                       Measure, Outcome),
+    n_complete = mapply(function(m, y) corr_fun(data[[m]], data[[y]])$n,
+                       Measure, Outcome)
+  )
+
+
+# Write report
+output_file <- "Outputs/DVG_vs_TCID50_CopyNumber_spearman_results.txt"
+if (!dir.exists("Outputs")) dir.create("Outputs")
+
+sink(output_file)
+cat("Spearman correlation results (overall, all samples)\n")
+cat("-------------------------------------------------\n\n")
+for (i in seq_len(nrow(corr_results))) {
+  cat(
+    corr_results$Outcome[i], "vs", corr_results$Measure[i],
+    "rho =", round(corr_results$rho[i], 3),
+    "p =", format.pval(corr_results$p_value[i], digits = 3),
+    "n =", corr_results$n_complete[i],
+    "\n"
+  )
+}
+sink()
+
+write.csv(corr_results,
+          "Outputs/DVG_vs_TCID50_CopyNumber_spearman_results.csv",
+          row.names = FALSE)
+
+cat(paste("Results saved to", output_file, "\n"))
+```
+
+PLOTS
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(MASS)
+
+###############################################
+## 1. Load data
+###############################################
+
+data <- read.csv("Outputs/dvg_sample_metrics.csv", sep = ",", header = TRUE)
+
+data <- data %>%
+  mutate(
+    SampleID    = as.character(SampleID),
+    Host        = as.factor(Host),
+    TCID50      = as.numeric(TCID50),
+    Copy.Number = as.numeric(Copy.Number),
+    DVG_count   = as.numeric(DVG_count),
+    mean_length = as.numeric(mean_length),
+    BP_entropy  = as.numeric(BP_entropy)
+  )
+
+###############################################
+## 2. Plot aesthetics (Prism-like)
+###############################################
+
+plot_theme <- theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 24, face = "bold", color = "black",
+                                margin = margin(t = 15)),
+    axis.title.y = element_text(size = 24, face = "bold", color = "black",
+                                margin = margin(r = 15)),
+    axis.text = element_text(size = 18, color = "black"),
+    axis.line = element_line(size = 1, color = "black"),
+    axis.ticks = element_line(size = 1, color = "black"),
+    axis.ticks.length = unit(5, "pt"),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    legend.text = element_text(size = 18),
+    legend.title = element_blank(),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 5)
+  )
+
+cols <- c(
+  "BALBF" = "#f94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+shapes <- c(
+  "BALBF" = 1,
+  "BALBM" = 22,
+  "BL6F"  = 16,
+  "BL6M"  = 15
+)
+
+###############################################
+## 3. Comparison lists
+###############################################
+
+tcid50_comparisons <- list(
+  list(x = "DVG_count",   xlab = "Unique DVGs",   y = "TCID50", ylab = expression(bold(TCID[50]))),
+  list(x = "mean_length", xlab = "Mean DVG length",    y = "TCID50", ylab = expression(bold(TCID[50]))),
+  list(x = "BP_entropy",  xlab = "Breakpoint entropy", y = "TCID50", ylab = expression(bold(TCID[50])))
+)
+
+copy_comparisons <- list(
+  list(x = "DVG_count",   xlab = "Unique DVGs",   y = "Copy.Number", ylab = "Copy number"),
+  list(x = "mean_length", xlab = "Mean DVG length",    y = "Copy.Number", ylab = "Copy number"),
+  list(x = "BP_entropy",  xlab = "Breakpoint entropy", y = "Copy.Number", ylab = "Copy number")
+)
+
+###############################################
+## 4. Regression helpers
+###############################################
+
+fit_global_regression <- function(df, xvar, yvar) {
+  df2 <- df %>% filter(is.finite(.data[[xvar]]), .data[[yvar]] > 0)
+  formula <- as.formula(paste0("log10(", yvar, ") ~ ", xvar))
+  MASS::rlm(formula, data = df2)
+}
+
+predict_line <- function(model, df, xvar) {
+  xs <- seq(min(df[[xvar]], na.rm = TRUE),
+            max(df[[xvar]], na.rm = TRUE),
+            length.out = 200)
+  newdata <- data.frame(x = xs)
+  names(newdata) <- xvar
+  preds <- predict(model, newdata = newdata)
+  tibble(x = xs, y = 10^preds)
+}
+
+###############################################
+## 5. Split-axis plotting function
+###############################################
+
+make_split_plot <- function(df, xvar, yvar, xlab, ylab,
+                            upper_range, lower_range,
+                            upper_breaks, lower_breaks,
+                            upper_labels = NULL,
+                            lower_labels = NULL,
+                            lod = NULL,
+                            height_ratio = c(9,1)) {
+
+  df <- df %>% filter(.data[[yvar]] > 0)
+
+  model   <- fit_global_regression(df, xvar, yvar)
+  regline <- predict_line(model, df, xvar)
+
+  ############################################################
+  ## Construct upper y-scale safely
+  ############################################################
+  if (!length(upper_breaks)) {
+    upper_scale <- scale_y_log10(limits = upper_range, breaks = NULL, labels = NULL)
+  } else if (is.null(upper_labels)) {
+    upper_scale <- scale_y_log10(limits = upper_range,
+                                 breaks = upper_breaks,
+                                 labels = upper_breaks)
+  } else {
+    upper_scale <- scale_y_log10(limits = upper_range,
+                                 breaks = upper_breaks,
+                                 labels = upper_labels)
+  }
+
+  ############################################################
+  ## Construct lower y-scale safely
+  ############################################################
+  if (!length(lower_breaks)) {
+    lower_scale <- scale_y_log10(limits = lower_range, breaks = NULL, labels = NULL)
+  } else if (is.null(lower_labels)) {
+    lower_scale <- scale_y_log10(limits = lower_range,
+                                 breaks = lower_breaks,
+                                 labels = lower_breaks)
+  } else {
+    lower_scale <- scale_y_log10(limits = lower_range,
+                                 breaks = lower_breaks,
+                                 labels = lower_labels)
+  }
+
+  ############################################################
+  ## TOP PANEL
+  ############################################################
+  p_top <- ggplot(df, aes(x = .data[[xvar]], y = .data[[yvar]],
+                          color = Host, shape = Host)) +
+    geom_point(size = 4, stroke = 1) +
+    geom_line(data = regline, aes(x = x, y = y),
+              inherit.aes = FALSE, linewidth = 1, color = "black") +
+    upper_scale +
+    scale_color_manual(values = cols) +
+    scale_shape_manual(values = shapes) +
+    plot_theme +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x  = element_blank(), 
+      #To make this the dashed line: axis.line.x = element_line(size = 1, color = "black", linetype = "dotted")
+      #To make it disappear: axis.line.x  = element_blank()
+      panel.border = element_blank(),
+      plot.margin  = margin(b = 10, t = 5, r = 15) #t = top margin r = right margin b = bottom margin (l = left margin
+    ) +
+    labs(y = ylab)
+
+  ## ADD dashed line to upper panel
+  if (!is.null(lod)) {
+    p_top <- p_top +
+      geom_hline(yintercept = lod,
+                 linetype = "dotted",
+                 linewidth = 1,
+                 color = "black")
+  }
+
+  ############################################################
+  ## BOTTOM PANEL
+  ############################################################
+  p_bottom <- ggplot(df, aes(x = .data[[xvar]], y = .data[[yvar]],
+                             color = Host, shape = Host)) +
+    geom_point(size = 4, stroke = 1.2) +
+    geom_line(data = regline, aes(x = x, y = y),
+              inherit.aes = FALSE, linewidth = 1, color = "black") +
+    lower_scale +
+    scale_x_continuous(breaks = scales::pretty_breaks(6)) +
+    scale_color_manual(values = cols) +
+    scale_shape_manual(values = shapes) +
+    plot_theme +
+    theme(
+      axis.title.y = element_blank(),
+      plot.margin  = margin(t = 0, b = 5, r = 15)
+    ) +
+    labs(x = xlab)
+
+  ############################################################
+  ## Combine panels safely
+  ############################################################
+  p_final <- p_top / p_bottom +
+    plot_layout(
+      heights = height_ratio,
+      guides = "collect"
+    ) &
+    theme(legend.position = "none")
+
+  return(p_final)
+}
+
+###############################################
+## 6. TCID50 plots
+###############################################
+
+if (!dir.exists("Images/Correlations"))
+  dir.create("Images/Correlations", recursive = TRUE)
+```
+
+
+```{r}
+for (comp in tcid50_comparisons) {
+
+  p <- make_split_plot(
+    df = data,
+    xvar = comp$x,
+    yvar = "TCID50",
+    xlab = comp$xlab,
+    ylab = comp$ylab,
+
+    upper_range  = c(1e3, 1e7),
+    lower_range  = c(0.5, 2),
+
+    upper_breaks = c(1e3, 1e4, 1e5, 1e6, 1e7),
+    lower_breaks = c(),
+
+    upper_labels = c("10³","10⁴","10⁵","10⁶","10⁷"),    # useful superscripts: ⁰¹²³⁴⁵⁶⁷⁸⁹ "10³","10⁴","10⁵","10⁶","10⁷, ""10⁸","10⁹","10¹⁰"
+    lower_labels = c(),
+
+    lod = 1000,            # drawn on TOP panel
+    height_ratio = c(9,1)
+  )
+
+  ggsave(
+    paste0("Images/Correlations/TCID50_", comp$x, ".png"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+  
+    ggsave(
+    paste0("Images/Correlations/TCID50_", comp$x, ".svg"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+}
+
+###############################################
+## 7. Copy number plots
+###############################################
+
+for (comp in copy_comparisons) {
+
+  p <- make_split_plot(
+    df = data,
+    xvar = comp$x,
+    yvar = "Copy.Number",
+    xlab = comp$xlab,
+    ylab = comp$ylab,
+
+#    upper_range  = c(1e6, 1e10),
+#    lower_range  = c(1, 10),
+
+#    upper_breaks = c(1e6, 1e7, 1e8, 1e9, 1e10),
+#    lower_breaks = c(),
+
+#    upper_labels = c("10⁶","10⁷","10⁸","10⁹","10¹⁰"),   # useful superscripts: ⁰¹²³⁴⁵⁶⁷⁸⁹
+#    lower_labels = c(),
+
+    upper_range  = c(1e7, 1.2e9),
+    lower_range  = c(1, 10),
+
+    upper_breaks = c(1e7, 1e8, 1e9),
+    lower_breaks = c(),
+
+    upper_labels = c("10⁷","10⁸","10⁹"),   # useful superscripts: ⁰¹²³⁴⁵⁶⁷⁸⁹
+    lower_labels = c(),
+
+    
+    lod = NULL, 
+    height_ratio = c(9,1)
+  )
+
+  ggsave(
+    paste0("Images/Correlations/Copy_", comp$x, ".png"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+  
+    ggsave(
+    paste0("Images/Correlations/Copy_", comp$x, ".svg"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+}
+
+
+```
+

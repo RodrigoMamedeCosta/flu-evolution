@@ -1,0 +1,3035 @@
+---
+title: "DVGfinder Analysis 2.0"
+author: "RC"
+date: "2025-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(car)
+library(MASS)
+library(purrr)
+library(FSA)
+```
+
+
+Let's open the data and look at it.
+
+```{r}
+############################################################
+## 0. LOAD BASE INPUT FILES
+############################################################
+
+consensus <- read.csv("DVGfinder_CONSENSUS_combined.csv", sep=',', header=TRUE)
+#ml        <- read.csv("DVGfinder_FILTERED_ML_combined.csv", sep=',', header=TRUE)
+#all       <- read.csv("DVGfinder_ALL_combined.csv", sep=',', header=TRUE)
+
+coverage <- read_csv("coverage_pol.csv")   # will be used for filtering based on coverage
+meta     <- read.csv("Metadata.csv", sep=',', header=TRUE)
+
+
+output_sample <- "sample_summary.csv"
+output_group  <- "groups_summary.csv"
+```
+
+
+```{r}
+############################################################
+## 1. PARAMETERS (adjust here)
+############################################################
+
+min_support <- 5              # Minimum read support for DVGs
+coverage_threshold <- 10      # Median polymerase coverage threshold
+polymerase_segments <- c("PB1","PB2","PA")
+
+# Select which DVG table to analyze
+dvg <- consensus    # or all / ml
+
+############################################################
+## 2. NORMALIZE SAMPLEID AND JOIN METADATA
+############################################################
+
+dvg  <- dvg  %>% mutate(SampleID = suppressWarnings(as.character(SampleID)))
+meta <- meta %>% mutate(SampleID = suppressWarnings(as.character(SampleID)))
+
+dvg <- left_join(dvg, meta, by = "SampleID")
+
+dvg <- dvg %>%
+  filter(Type == "HOM") %>% 
+  filter(!SampleID %in% c("9770", "10318"))
+
+############################################################
+## 3. REORDER COLUMNS (METADATA FIRST)
+############################################################
+
+meta_cols   <- intersect(c("SampleID", setdiff(names(meta), "SampleID")), names(dvg))
+segment_col <- "Segment"
+dvg_cols    <- setdiff(names(dvg), c(meta_cols, segment_col))
+
+dvg <- dvg[, c(meta_cols, segment_col, dvg_cols)]
+
+if (!dir.exists("Outputs")) dir.create("Outputs")
+stats_file <- "Outputs/dvg_stats_summary.txt"
+file.create(stats_file)
+
+############################################################
+## 4. COVERAGE FILTERING (coverage_pol.csv)
+############################################################
+
+coverage <- coverage %>% mutate(SampleID = as.character(SampleID))
+pol_cols <- grep("^(PB1|PB2|PA)\\.", colnames(coverage), value = TRUE)
+
+sample_cov <- coverage %>%
+  dplyr::mutate(
+    median_pol_cov = apply(
+      dplyr::select(., all_of(pol_cols)),
+      1,
+      median,
+      na.rm = TRUE
+    )
+  ) %>%
+  dplyr::select(SampleID, median_pol_cov)
+
+good_samples <- sample_cov %>%
+  filter(median_pol_cov >= coverage_threshold) %>%
+  pull(SampleID)
+
+dvg <- dvg %>%
+  filter(SampleID %in% good_samples)
+
+############################################################
+## 5. FILTER DVG EVENTS (support, NA checks, length)
+############################################################
+
+dvg_filt <- dvg %>%
+  filter(
+    !is.na(BP),
+    !is.na(RI),
+    length_dvg > 0,
+    mean_read_counts >= min_support,
+    DVG_type != "Deletion_reverse"
+  )
+
+
+############################################################
+## 5b. CLASSIFY IN-FRAME VS FRAMESHIFT (per event)
+############################################################
+
+dvg_filt <- dvg_filt %>%
+  mutate(
+    del_nt    = RI - BP + 1,
+    in_frame  = if_else(del_nt %% 3 == 0, TRUE, FALSE, missing = FALSE),
+    deletive  = grepl("Deletion", DVG_type, ignore.case = TRUE)
+  )
+# `deletive` lets you subset to true deletion events only if you want.
+
+############################################################
+## 6. HELPER FUNCTIONS
+############################################################
+
+shannon_entropy <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  p <- table(x) / length(x)
+  -sum(p * log(p))
+}
+
+shannon_weighted_reads <- function(reads) {
+  reads <- reads[is.finite(reads) & reads > 0]
+  if (length(reads) == 0) return(NA_real_)
+  p <- reads / sum(reads)
+  -sum(p * log(p))
+}
+
+q90_safe <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  as.numeric(quantile(x, 0.9, names = FALSE))
+}
+
+log_to_stats <- function(..., sep = " ") {
+  cat(..., sep = sep, file = stats_file, append = TRUE)
+  cat("\n", file = stats_file, append = TRUE)
+}
+
+log_block <- function(obj) {
+  cat(capture.output(print(obj)), sep = "\n",
+      file = stats_file, append = TRUE)
+}
+
+results_list <- list()
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return(format(p, scientific = TRUE, digits = 3))
+  sprintf("%.4f", p)
+}
+
+############################################################
+## 7. PER-SAMPLE METRICS (EVENT-LEVEL INPUT: dvg_filt)
+############################################################
+
+viral_load_est <- dvg_filt %>%
+  filter(mean_read_counts > 0, mean_rpht > 0) %>%
+  mutate(total_viral_reads_est = mean_read_counts * 1e5 / mean_rpht) %>%
+  group_by(SampleID) %>%
+  summarise(
+    viral_reads_est = median(total_viral_reads_est, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## 7a. per-sample, per-segment read-based polymerase fraction and frame stats
+
+# Per-sample per-segment polymerase read fraction and frame counts
+segment_frame_stats <- dvg_filt %>%
+  group_by(across(all_of(meta_cols)), Segment) %>%
+  summarise(
+    segment_support          = sum(mean_read_counts, na.rm = TRUE),
+    seg_inframe_reads        = sum(mean_read_counts[deletive & in_frame], na.rm = TRUE),
+    seg_frameshift_reads     = sum(mean_read_counts[deletive & !in_frame], na.rm = TRUE),
+    seg_inframe_count        = sum(deletive & in_frame, na.rm = TRUE),
+    seg_frameshift_count     = sum(deletive & !in_frame, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(across(all_of(meta_cols))) %>%
+  mutate(
+    total_segment_support    = sum(segment_support, na.rm = TRUE),
+    frac_segment_support     = if_else(total_segment_support > 0,
+                                       segment_support / total_segment_support,
+                                       NA_real_),
+    frac_inframe_reads_seg   = if_else(segment_support > 0,
+                                       seg_inframe_reads / segment_support,
+                                       NA_real_),
+    frac_inframe_events_seg  = if_else(
+                                 (seg_inframe_count + seg_frameshift_count) > 0,
+                                 seg_inframe_count / (seg_inframe_count + seg_frameshift_count),
+                                 NA_real_
+                               )
+  ) %>%
+  ungroup()
+
+write.csv(
+  segment_frame_stats,
+  "Outputs/dvg_segment_frame_stats_per_sample.csv",
+  row.names = FALSE
+)
+
+## 7b. per-sample collapsed metrics (what you had, plus new polymerase read fraction and frame totals)
+
+sample_metrics <- dvg_filt %>%
+  group_by(across(all_of(meta_cols))) %>%
+  summarise(
+    DVG_count        = n_distinct(cID_DI),
+
+    mean_length      = mean(length_dvg),
+    median_length    = median(length_dvg),
+    p90_length       = q90_safe(length_dvg),
+    sd_length        = sd(length_dvg),
+    IQR_length       = IQR(length_dvg),
+
+    total_support    = sum(mean_read_counts),
+    sum_rpht         = sum(mean_rpht, na.rm = TRUE),
+
+    shannon_weighted = shannon_weighted_reads(mean_read_counts),
+    top1_fraction    = max(mean_read_counts) / sum(mean_read_counts),
+
+    BP_entropy       = shannon_entropy(paste(Segment, BP, sep = ":")),
+
+    # fraction of DVG *species* (unique DI events) in PB1/PB2/PA
+    fraction_polymerase_species = mean(Segment %in% polymerase_segments),
+
+    n_segments_with_dvg = n_distinct(Segment),
+
+    # read-level polymerase support (THIS MUST BE NUMERIC)
+    polymerase_support = sum(mean_read_counts[Segment %in% polymerase_segments], na.rm = TRUE),
+
+    fraction_polymerase_reads = sum(mean_read_counts[Segment %in% polymerase_segments], na.rm = TRUE) /
+                            sum(mean_read_counts, na.rm = TRUE),
+
+    # In-frame vs frameshift totals (deletion events only)
+    inframe_reads_total    = sum(mean_read_counts[deletive & in_frame], na.rm = TRUE),
+    frameshift_reads_total = sum(mean_read_counts[deletive & !in_frame], na.rm = TRUE),
+
+    inframe_events_total    = sum(deletive & in_frame),
+    frameshift_events_total = sum(deletive & !in_frame),
+
+    frac_inframe_reads_total = sum(mean_read_counts[deletive & in_frame], na.rm = TRUE) /
+                               (sum(mean_read_counts[deletive & in_frame], na.rm = TRUE) +
+                                sum(mean_read_counts[deletive & !in_frame], na.rm = TRUE)),
+
+    frac_inframe_events_total = sum(deletive & in_frame) /
+                                (sum(deletive & in_frame) + sum(deletive & !in_frame)),
+
+    .groups = "drop"
+  ) %>%
+  left_join(viral_load_est, by = "SampleID") %>%
+  mutate(
+    normalized_richness_rpht =
+      ifelse(is.finite(viral_reads_est) & viral_reads_est > 0,
+             DVG_count / viral_reads_est * 1e5,
+             NA_real_),
+
+    normalized_abundance_rpht =
+      ifelse(is.finite(viral_reads_est) & viral_reads_est > 0,
+             total_support / viral_reads_est * 1e5,
+             NA_real_)
+  )
+
+
+############################################################
+## 8. ZERO-DVG SAMPLES
+############################################################
+
+sample_metrics_full <- all_samples %>%
+  left_join(sample_metrics, by = meta_cols) %>%
+  mutate(
+    DVG_count = replace_na(DVG_count, 0),
+
+    mean_length   = ifelse(DVG_count == 0, NA_real_, mean_length),
+    median_length = ifelse(DVG_count == 0, NA_real_, median_length),
+    p90_length    = ifelse(DVG_count == 0, NA_real_, p90_length),
+    sd_length     = ifelse(DVG_count == 0, NA_real_, sd_length),
+    IQR_length    = ifelse(DVG_count == 0, NA_real_, IQR_length),
+
+    total_support = ifelse(DVG_count == 0, 0, total_support),
+    sum_rpht      = ifelse(DVG_count == 0, 0, sum_rpht),
+
+    shannon_weighted = ifelse(DVG_count == 0, NA_real_, shannon_weighted),
+    top1_fraction    = ifelse(DVG_count == 0, NA_real_, top1_fraction),
+
+    BP_entropy = ifelse(DVG_count == 0, NA_real_, BP_entropy),
+
+    fraction_polymerase_species = ifelse(DVG_count == 0, NA_real_, fraction_polymerase_species),
+    n_segments_with_dvg         = ifelse(DVG_count == 0, NA_real_, n_segments_with_dvg),
+
+    polymerase_support    = ifelse(DVG_count == 0, 0, polymerase_support),
+    fraction_polymerase_reads = ifelse(DVG_count == 0, NA_real_, fraction_polymerase_reads),
+
+    inframe_reads_total     = ifelse(DVG_count == 0, 0, inframe_reads_total),
+    frameshift_reads_total  = ifelse(DVG_count == 0, 0, frameshift_reads_total),
+    inframe_events_total    = ifelse(DVG_count == 0, 0, inframe_events_total),
+    frameshift_events_total = ifelse(DVG_count == 0, 0, frameshift_events_total),
+
+    frac_inframe_reads_total  = ifelse(DVG_count == 0, NA_real_, frac_inframe_reads_total),
+    frac_inframe_events_total = ifelse(DVG_count == 0, NA_real_, frac_inframe_events_total),
+
+    viral_reads_est           = ifelse(DVG_count == 0, NA_real_, viral_reads_est),
+    normalized_richness_rpht  = ifelse(DVG_count == 0, NA_real_, normalized_richness_rpht),
+    normalized_abundance_rpht = ifelse(DVG_count == 0, NA_real_, normalized_abundance_rpht)
+  )
+
+
+write.csv(sample_metrics_full,
+          "Outputs/dvg_sample_metrics.csv",
+          row.names = FALSE)
+
+############################################################
+## 9. GROUP-LEVEL METRICS (HOST / STRAIN / SEX)
+############################################################
+
+group_metrics <- sample_metrics_full %>%
+  group_by(Host, HostStrain, Sex) %>%
+  summarise(
+    n_samples          = n(),
+
+    mean_count         = mean(DVG_count),
+    mean_mean_length   = mean(mean_length, na.rm = TRUE),
+    mean_p90_length    = mean(p90_length, na.rm = TRUE),
+    mean_sd_length     = mean(sd_length, na.rm = TRUE),
+    mean_IQR_length    = mean(IQR_length, na.rm = TRUE),
+
+    mean_support       = mean(total_support),
+    mean_sum_rpht      = mean(sum_rpht, na.rm = TRUE),
+
+    mean_shannon_weighted = mean(shannon_weighted, na.rm = TRUE),
+    mean_top1_fraction    = mean(top1_fraction, na.rm = TRUE),
+
+    mean_entropy       = mean(BP_entropy, na.rm = TRUE),
+    mean_fraction_poly = mean(fraction_polymerase_species, na.rm = TRUE),
+    mean_n_segments    = mean(n_segments_with_dvg, na.rm = TRUE),
+
+    mean_polymerase_support    = mean(polymerase_support),
+    mean_fraction_polymerase_reads = mean(fraction_polymerase_reads, na.rm = TRUE),
+
+    mean_inframe_reads_total     = mean(inframe_reads_total),
+    mean_frameshift_reads_total  = mean(frameshift_reads_total),
+    mean_frac_inframe_reads_total= mean(frac_inframe_reads_total, na.rm = TRUE),
+
+    mean_inframe_events_total    = mean(inframe_events_total),
+    mean_frameshift_events_total = mean(frameshift_events_total),
+    mean_frac_inframe_events_total = mean(frac_inframe_events_total, na.rm = TRUE),
+
+    mean_viral_reads_est = mean(viral_reads_est, na.rm = TRUE),
+    mean_norm_richness   = mean(normalized_richness_rpht, na.rm = TRUE),
+    mean_norm_abundance  = mean(normalized_abundance_rpht, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+write.csv(group_metrics,
+          "Outputs/dvg_group_metrics.csv",
+          row.names = FALSE)
+
+############################################################
+## 10. PREP FOR KW / WILCOXON
+############################################################
+
+sample_metrics_full <- sample_metrics_full %>%
+  mutate(
+    Host       = factor(Host),
+    HostStrain = factor(HostStrain),
+    Sex        = factor(Sex)
+  )
+
+run_kw_pw_host <- function(df, var_name, label) {
+
+  y <- df[[var_name]]
+
+  f  <- as.formula(paste(var_name, "~ Host"))
+  kw <- kruskal.test(f, data = df)
+
+  ws <- wilcox.test(df[[var_name]] ~ df$HostStrain)
+  wx <- wilcox.test(df[[var_name]] ~ df$Sex)
+
+  log_to_stats("\n==============================")
+  log_to_stats("Metric:", label)
+  log_to_stats("==============================")
+  log_to_stats("\n>>> Host (Kruskal–Wallis)")
+  log_block(kw)
+  log_to_stats("\nHostStrain (Wilcoxon):")
+  log_block(ws)
+  log_to_stats("\nSex (Wilcoxon):")
+  log_block(wx)
+
+  results_list[[label]] <<- tibble(
+    Metric              = label,
+    KW_Host             = format_p(kw$p.value),
+    Wilcoxon_HostStrain = format_p(ws$p.value),
+    Wilcoxon_Sex        = format_p(wx$p.value)
+  )
+}
+
+############################################################
+## 11. RUN STATS (OLD + NEW METRICS)
+############################################################
+
+# all samples
+run_kw_pw_host(sample_metrics_full, "DVG_count",     "DVG_count")
+run_kw_pw_host(sample_metrics_full, "total_support","total_support")
+run_kw_pw_host(sample_metrics_full, "sum_rpht",     "sum_rpht")
+
+# new read-based polymerase fraction (all samples)
+run_kw_pw_host(sample_metrics_full, "fraction_polymerase_reads", "fraction_polymerase_reads")
+
+# DVG positive only
+dvg_pos <- sample_metrics_full %>% filter(DVG_count > 0)
+
+run_kw_pw_host(dvg_pos, "mean_length",   "mean_length")
+run_kw_pw_host(dvg_pos, "sd_length",     "sd_length")
+run_kw_pw_host(dvg_pos, "IQR_length",    "IQR_length")
+run_kw_pw_host(dvg_pos, "BP_entropy",    "BP_entropy")
+run_kw_pw_host(dvg_pos, "shannon_weighted", "shannon_weighted")
+run_kw_pw_host(dvg_pos, "top1_fraction", "top1_fraction")
+run_kw_pw_host(dvg_pos, "fraction_polymerase_species", "fraction_polymerase_species")
+run_kw_pw_host(dvg_pos, "n_segments_with_dvg", "n_segments_with_dvg")
+run_kw_pw_host(dvg_pos, "normalized_richness_rpht",  "normalized_richness_rpht")
+run_kw_pw_host(dvg_pos, "normalized_abundance_rpht", "normalized_abundance_rpht")
+
+# new frame-related metrics (DVG+ only)
+run_kw_pw_host(dvg_pos, "frac_inframe_reads_total",   "frac_inframe_reads_total")
+run_kw_pw_host(dvg_pos, "frac_inframe_events_total",  "frac_inframe_events_total")
+
+results_df <- bind_rows(results_list)
+
+write.csv(results_df,
+          "Outputs/dvg_stats_summary_pvalues.csv",
+          row.names = FALSE)
+
+############################################################
+## 12. DVG TYPE METRICS (UNCHANGED)
+############################################################
+
+dvg_filt_types <- dvg %>%
+  filter(
+    !is.na(DVG_type),
+    !is.na(SampleID),
+    mean_read_counts >= min_support
+  )
+
+dvg_type_counts <- dvg_filt_types %>%
+  group_by(SampleID, Host, HostStrain, Sex, DVG_type) %>%
+  summarise(n = n(), .groups="drop") %>%
+  group_by(SampleID, Host, HostStrain, Sex) %>%
+  tidyr::complete(DVG_type, fill=list(n=0)) %>%
+  ungroup()
+
+dvg_type_group_summary <- dvg_type_counts %>%
+  group_by(DVG_type, Host, HostStrain, Sex) %>%
+  summarise(
+    mean   = mean(n),
+    median = median(n),
+    p90    = quantile(n,0.9),
+    sd     = sd(n),
+    .groups="drop"
+  )
+
+if (!dir.exists("Outputs/DVG_Types")) dir.create("Outputs/DVG_Types")
+write.csv(dvg_type_group_summary,
+          "Outputs/DVG_Types/dvg_type_group_summary.csv",
+          row.names=FALSE)
+
+```
+
+
+_________________________
+#### QUICK CORRELATIONS.
+________________________
+
+```{r}
+# ============================================================
+# CORRELATIONS WITH TCID50 AND COPY NUMBER
+# ============================================================
+
+corr_df <- sample_metrics_full %>%
+  mutate(
+    TCID50      = suppressWarnings(as.numeric(TCID50)),
+    Copy.Number = suppressWarnings(as.numeric(Copy.Number))
+  )
+
+metric_list <- c(
+  "DVG_count",
+  "mean_length",
+  "sd_length",
+  "IQR_length",
+  "total_support",
+  "sum_rpht",
+  "BP_entropy",
+  "shannon_weighted",
+  "top1_fraction",
+  "fraction_polymerase_species",
+  "fraction_polymerase_reads",
+  "n_segments_with_dvg",
+  "normalized_richness_rpht",
+  "normalized_abundance_rpht"
+)
+
+# Convert ALL metric columns in metric_list to numeric
+for (m in metric_list) {
+  if (m %in% names(corr_df)) {
+    corr_df[[m]] <- suppressWarnings(as.numeric(corr_df[[m]]))
+  }
+}
+
+
+corr_fun <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3) {
+    tibble(correlation = NA_real_, p_value = NA_real_)
+  } else {
+    ct <- cor.test(x[ok], y[ok], method = "spearman", exact = FALSE)
+    tibble(correlation = ct$estimate, p_value = ct$p.value)
+  }
+}
+
+
+
+cor_results <- tibble(Measure = metric_list) %>%
+  rowwise() %>%
+  mutate(
+    TCID50_corr = list(corr_fun(corr_df[[Measure]], corr_df$TCID50)),
+    Copy_corr   = list(corr_fun(corr_df[[Measure]], corr_df$Copy.Number))
+  ) %>%
+  unnest_wider(TCID50_corr, names_sep = "_TCID50_") %>%
+  unnest_wider(Copy_corr,   names_sep = "_Copy_")
+
+print(cor_results)
+
+write.csv(
+  cor_results,
+  "Outputs/dvg_correlations_TCID50_CopyNumber.csv",
+  row.names = FALSE
+)
+
+
+```
+
+AND WE PLOT.
+
+```{r}
+############################################################
+#                     PLOTTING SECTION
+############################################################
+
+plot_theme <- theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 20, face = "bold", color = "black",
+                                margin = margin(t = 15)),
+    axis.title.y = element_text(size = 20, face = "bold", color = "black",
+                                margin = margin(r = 15)),
+    axis.text = element_text(size = 16, color = "black"),
+    axis.line = element_line(size = 1, color = "black"),
+    axis.ticks = element_line(size = 1),
+    axis.ticks.length = unit(6, "pt"),
+    panel.grid = element_blank(),
+    legend.position = "none"     # clean: remove all legends
+  )
+
+cols <- c(
+  BALBF = "#f94040",
+  BALBM = "#0000FF",
+  BL6F  = "#C5944E",
+  BL6M  = "#0F99B2"
+)
+
+shapes <- c(
+  BALBF = 1,
+  BALBM = 22,
+  BL6F  = 16,
+  BL6M  = 15
+)
+
+# ============================================================
+# Mean ± SE helper
+# ============================================================
+
+mean_se_df <- function(x) {
+  m  <- mean(x, na.rm = TRUE)
+  se <- sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+  data.frame(y = m, ymin = m - se, ymax = m + se)
+}
+
+# ============================================================
+# Unified plotting function (Option 1)
+# ============================================================
+
+make_metric_plot <- function(df, metric, ylab, logscale = FALSE) {
+
+  base <- ggplot(df, aes(x = Host, y = .data[[metric]], 
+                         color = Host, shape = Host)) +
+
+    # Mean horizontal line
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 95,        # thick horizontal line
+      size = 12,
+      color = "black",
+      stroke = 1
+    ) +
+
+    # SE whiskers
+    stat_summary(
+      fun.data = mean_se_df,
+      geom = "errorbar",
+      width = 0.15,
+      linewidth = 0.6,
+      color = "black"
+    ) +
+
+    # Individual points
+    geom_jitter(size = 3.8, width = 0.20, alpha = 0.95, stroke = 1) +
+
+    scale_color_manual(values = cols) +
+    scale_shape_manual(values = shapes) +
+
+    labs(x = "", y = ylab) +
+    plot_theme
+
+  if (logscale) {
+    base <- base + scale_y_log10()
+  }
+
+  base
+}
+
+# ============================================================
+# Output folder
+# ============================================================
+
+if (!dir.exists("Images/Metrics"))
+  dir.create("Images/Metrics", recursive = TRUE)
+
+# ============================================================
+# Updated full list of metrics to plot
+# ============================================================
+
+metrics_to_plot <- list(
+
+  # richness / abundance
+  list(var = "DVG_count",                 label = "Unique DVGs",                         log = FALSE),
+  list(var = "total_support",             label = "Total Support (reads)",               log = TRUE),
+  list(var = "sum_rpht",                  label = "Sum RPHT",                            log = TRUE),
+
+  # normalized metrics
+  list(var = "normalized_richness_rpht",  label = "Normalized Richness (per 1e5)",       log = FALSE),
+  list(var = "normalized_abundance_rpht", label = "Normalized Abundance (per 1e5)",      log = TRUE),
+
+  # length distribution
+  list(var = "mean_length",               label = "Mean Deletion Length",                     log = FALSE),
+  list(var = "median_length",             label = "Median Deletion Length",                   log = FALSE),
+  list(var = "p90_length",                label = "P90 Length",                          log = FALSE),
+  list(var = "sd_length",                 label = "SD Length",                           log = FALSE),
+  list(var = "IQR_length",                label = "IQR Length",                          log = FALSE),
+
+  # population structure
+  list(var = "BP_entropy",                label = "Breakpoint Entropy",                  log = FALSE),
+  list(var = "shannon_weighted",          label = "Shannon (weighted by reads)",         log = FALSE),
+  list(var = "top1_fraction",             label = "Top DVG Fraction",                    log = FALSE),
+
+  # segment structure
+  list(var = "fraction_polymerase_species",       label = "Fraction Polymerase-derived Species",         log = FALSE),
+  list(var = "fraction_polymerase_reads",       label = "Fraction Polymerase-derived Reads",         log = FALSE),
+  list(var = "n_segments_with_dvg",       label = "Number of Segments with DVGs",        log = FALSE),
+
+  # viral load estimate
+  list(var = "viral_reads_est",           label = "Estimated Viral Reads",               log = TRUE)
+)
+
+# ============================================================
+# Generate each plot automatically
+# ============================================================
+
+for (m in metrics_to_plot) {
+
+  df_sub <- sample_metrics_full %>% filter(!is.na(.data[[m$var]]))
+
+  p <- make_metric_plot(
+    df = df_sub,
+    metric = m$var,
+    ylab = m$label,
+    logscale = m$log
+  )
+
+  ggsave(
+    paste0("Images/Metrics/", m$var, ".png"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+  ggsave(
+    paste0("Images/Metrics/", m$var, ".svg"),
+    p, width = 7, height = 5, dpi = 300, bg = "white"
+  )
+
+  print(p)
+}
+
+
+```
+
+ECDF Mean length
+
+```{r}
+# ============================================================
+# Prism-like theme (your version)
+# ============================================================
+
+plot_theme <- theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 24, face = "bold", color = "black",
+                                margin = margin(t = 15)),
+    axis.title.y = element_text(size = 24, face = "bold", color = "black",
+                                margin = margin(r = 15)),
+    axis.text = element_text(size = 18, color = "black"),
+    axis.line = element_line(size = 1, color = "black"),
+    axis.ticks = element_line(size = 1),
+    axis.ticks.length = unit(8, "pt"),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    legend.text = element_text(size = 18),
+    legend.title = element_blank()
+  )
+
+# Colors
+cols <- c(
+  BALBF = "#f94040",
+  BALBM = "#0000FF",
+  BL6F  = "#C5944E",
+  BL6M  = "#0F99B2"
+)
+
+# Line styles:
+# BALB groups dashed, BL6 groups solid
+line_types <- c(
+  BALBF = "dashed",
+  BALBM = "dashed",
+  BL6F  = "solid",
+  BL6M  = "solid"
+)
+
+# ============================================================
+# ECDF PLOT with custom x-axis limits
+# ============================================================
+
+# Adjust these as needed:
+x_min <- 0
+x_max <- 2300   # <-- change this to whatever you want
+
+p_ecdf <- ggplot(dvg_filt, aes(x = length_dvg, color = Host, linetype = Host)) +
+  stat_ecdf(geom = "step", linewidth = 1) +
+
+  scale_color_manual(values = cols) +
+  scale_linetype_manual(values = line_types) +
+
+  scale_x_continuous(limits = c(x_min, x_max)) +
+
+  labs(
+    x = "DVG Length",
+    y = "ECDF"
+  ) +
+
+  plot_theme +
+  theme(
+    legend.title = element_blank()
+  )
+
+p_ecdf
+
+# Save
+ggsave("Images/Metrics/ECDF_length.png",
+       p_ecdf, width = 8, height = 5, dpi = 300, bg = "white")
+
+ggsave("Images/Metrics/ECDF_length.svg",
+       p_ecdf, width = 8, height = 5, dpi = 300, bg = "white")
+
+```
+
+
+____________________
+##### SEGMENT PLOTS
+____________________
+By support. Change alpha of lines before/after/between ticks to show either the inside of deletion or the outside (genome before and after break)
+
+```{r}
+## ============================================================
+## DVG line plots: BP / RI on x, per-DVG support on y
+## ============================================================
+
+# List of segments and their approximate plotting x limits
+segs  <- c("PB1", "PB2", "PA", "HA", "NP", "NR", "M", "NS")
+xlims <- c(2285, 2284, 2183, 1717, 1506, 1426,  985,  847)
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+# Segment genomic coordinates (start, end)
+segment_ends <- list(
+  PB1 = c(1, 2341),
+  PB2 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+# Loop over segments
+for (i in seq_along(segs)) {
+
+  segment  <- segs[i]
+  xlim_max <- xlims[i]
+
+  # Use already filtered DVGs (by support etc.)
+  df1 <- dvg_filt %>%
+    filter(Segment == segment)
+
+  if (nrow(df1) == 0) {
+    message("No DVGs for segment ", segment, ", skipping.")
+    next
+  }
+
+  # y is per-DVG support (mean_read_counts from DVGfinder)
+  # set a reasonable y-range per segment
+  y_max <- max(df1$mean_read_counts, na.rm = TRUE)
+  if (!is.finite(y_max) || y_max <= 0) {
+    message("Non-finite y_max for segment ", segment, ", skipping.")
+    next
+  }
+
+  # vertical half-height of the start / end ticks, scaled to the y-range
+  delheight <- y_max * 0.02  # 2 percent of max support
+  delwidth  <- 0.7           # line width for ticks
+
+  # dummy data to ensure all host colors are in scale (even if absent for this segment)
+  dummy_data <- expand.grid(
+    SampleID   = "dummy",
+    Sex        = "X",
+    HostStrain = "Dummy",
+    Host       = names(colors),
+    Treatment  = "Dummy",
+    Type       = "Dummy",
+    Line       = "Dummy",
+    Virulence  = 0,
+    TCID50     = 0,
+    Copy.Number = 0,
+    npoly      = 0,
+    Nei_D      = 0,
+    geneDiv    = 0,
+    Segment    = segment,
+    BP         = 1,
+    RI         = 2,
+    mean_read_counts = 0
+  )
+
+  df1_plot <- bind_rows(df1, dummy_data)
+
+  seg_start <- segment_ends[[segment]][1]
+  seg_end   <- segment_ends[[segment]][2]
+
+  p <- ggplot(df1_plot, aes(color = Host)) +
+
+    # Thin line from segment start to BP
+    geom_segment(
+      aes(x = seg_start, xend = BP,
+          y = mean_read_counts, yend = mean_read_counts),
+      linewidth = 0.2,
+      linetype  = "dotted",
+      alpha = 1
+    ) +
+
+    # Tick at BP
+    geom_segment(
+      aes(x = BP, xend = BP,
+          y = mean_read_counts - delheight,
+          yend = mean_read_counts + delheight),
+      linewidth = delwidth
+    ) +
+
+    # Horizontal deletion line between BP and RI
+    geom_segment(
+      aes(x = BP, xend = RI,
+          y = mean_read_counts, yend = mean_read_counts),
+      linewidth = 0.2,
+      linetype  = "dotted",
+      alpha = 0
+    ) +
+
+    # Tick at RI
+    geom_segment(
+      aes(x = RI, xend = RI,
+          y = mean_read_counts - delheight,
+          yend = mean_read_counts + delheight),
+      linewidth = delwidth
+    ) +
+
+    # Thin line from RI to segment end
+    geom_segment(
+      aes(x = RI, xend = seg_end,
+          y = mean_read_counts, yend = mean_read_counts),
+      linewidth = 0.2,
+      linetype  = "dotted",
+      alpha = 1
+    ) +
+
+    scale_color_manual(values = colors, drop = FALSE) +
+    coord_cartesian(
+      xlim = c(seg_start, seg_end),
+      expand = FALSE
+    ) +
+    scale_x_continuous(breaks = seq(0, seg_end, by = 250)) +
+    # let ggplot choose y breaks; you can also set them manually if you prefer
+    scale_y_continuous() +
+    theme_minimal() +
+    theme(
+      plot.margin      = unit(c(1, 1, 2, 1), "lines"),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position  = "none",
+      axis.text        = element_text(size = 16, color = "black"),
+      axis.title       = element_text(size = 20, face = "bold", color = "black"),
+      axis.title.x     = element_text(vjust = -1),
+      axis.title.y     = element_text(vjust = +2),
+      axis.ticks       = element_line(colour = "black", linewidth = 1),
+      axis.ticks.length = unit(.25, "cm"),
+      axis.line        = element_line(color = "black", linewidth = 1)
+    ) +
+    labs(
+      x = "Genomic position",
+      y = "DVG read support"
+    )
+
+  ggsave(
+    paste0("Images/DVG Segment Plots - Support/DVGlines_", segment, "_genome.png"),
+    p, width = 8, height = 5, dpi = 300
+  )
+  ggsave(
+    paste0("Images/DVG Segment Plots - Support/DVGlines_", segment, "_genome.svg"),
+    p, width = 8, height = 5, dpi = 300, device = "svg"
+  )
+}
+
+```
+
+
+
+Support, combined segments
+```{r}
+###############################################################
+## 1. SETTINGS
+###############################################################
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1, 2341),
+  PB1 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+host_order <- c("BALBF","BALBM","BL6F","BL6M")
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+
+###############################################################
+## 2. PREP DATA
+###############################################################
+
+stopifnot(all(c("mean_read_counts","BP","RI","Segment","SampleID","Host") %in% names(dvg_filt)))
+
+dvg_sup <- dvg_filt %>%
+  filter(
+    !is.na(Segment),
+    Segment %in% segment_order,
+    !is.na(BP),
+    !is.na(RI)
+  ) %>%
+  mutate(
+    Segment = factor(Segment, levels = segment_order),
+    Host    = factor(Host,    levels = host_order)
+  ) %>%
+  group_by(SampleID, Segment) %>%
+  mutate(
+    support_segment = mean_read_counts
+  ) %>%
+  ungroup()
+
+# global max (for y-axis limit)
+y_max_support <- max(dvg_sup$support_segment, na.rm = TRUE)
+y_max_support <- ceiling(y_max_support * 1.2)
+
+# tick height factor for log axis
+tick_factor <- 1.1
+
+
+###############################################################
+## 3. BUILD MASTER DF FOR COMBINED PLOT
+###############################################################
+
+full_plot_df <- bind_rows(lapply(segment_order, function(seg) {
+  df <- dvg_sup %>% filter(Segment == seg)
+  if (nrow(df)==0) return(NULL)
+  df$seg_start <- segment_ends[[seg]][1]
+  df$seg_end   <- segment_ends[[seg]][2]
+  df
+}))
+
+full_plot_df$Segment <- factor(full_plot_df$Segment, levels = segment_order)
+
+
+###############################################################
+## 4. FUNCTION TO PLOT ONE SEGMENT (COMBINED PANEL)
+###############################################################
+
+plot_seg_support <- function(df_seg, seg_name, first=FALSE){
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  ggplot(df_seg, aes(color = Host)) +
+
+    # genome left of BP
+    geom_segment(aes(
+      x = seg_start, xend = BP,
+      y = support_segment, yend = support_segment),
+      linewidth = 0.2, linetype = "dotted", alpha = 0
+    ) +
+
+    # BP tick (log-scale)
+    geom_segment(aes(
+      x = BP, xend = BP,
+      y = support_segment / tick_factor,
+      yend = support_segment * tick_factor),
+      linewidth = 1, alpha = 0.8
+    ) +
+
+    # deletion
+    geom_segment(aes(
+      x = BP, xend = RI,
+      y = support_segment, yend = support_segment),
+      linewidth = 0.2, alpha = 0.8, linetype = "dotted"
+    ) +
+
+    # RI tick (log-scale)
+    geom_segment(aes(
+      x = RI, xend = RI,
+      y = support_segment / tick_factor,
+      yend = support_segment * tick_factor),
+      linewidth = 1, alpha = 0.8
+    ) +
+
+    # genome right of RI
+    geom_segment(aes(
+      x = RI, xend = seg_end,
+      y = support_segment, yend = support_segment),
+      linewidth = 0.2, linetype = "dotted", alpha = 0
+    ) +
+
+    scale_color_manual(values = colors) +
+
+    # X axis
+    scale_x_continuous(
+      limits = c(seg_start, seg_end),
+      breaks = seq(0, seg_end, by = 500),
+      expand = c(0,0)
+    ) +
+
+    # LOG Y
+    scale_y_log10(
+      limits = c(5, y_max_support),
+      breaks = c(10, 100, 1000, 10000),
+      labels = c("10","100","1000","10000"),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if(first) "DVG read support" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+
+      legend.position = "none",
+
+      axis.text.x  = element_text(size = 10, color = "black"),
+      axis.title.x = element_text(size = 12, face = "bold"),
+
+      axis.text.y  = if(first) element_text(size = 10) else element_blank(),
+      axis.title.y = if(first) element_text(size = 12, face = "bold") else element_blank(),
+      axis.ticks.y = if(first) element_line(color="black") else element_blank(),
+      axis.line.y  = if(first) element_line(color="black") else element_blank(),
+
+      axis.line.x  = element_line(color="black"),
+      axis.ticks.x = element_line(color="black"),
+      axis.ticks.length = unit(3, "pt")
+    )
+}
+
+
+###############################################################
+## 5. CREATE PANELS FOR ALL SEGMENTS AND COMBINE
+###############################################################
+
+plots <- lapply(seq_along(segment_order), function(i){
+  seg <- segment_order[i]
+  df_seg <- full_plot_df %>% filter(Segment==seg)
+  plot_seg_support(df_seg, seg, first=(i==1))
+})
+
+segment_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+relative_widths <- segment_lengths[segment_order] / sum(segment_lengths)
+
+combined_sup <- wrap_plots(plots, nrow=1, widths=relative_widths)
+
+
+###############################################################
+## 6. SAVE
+###############################################################
+
+if (!dir.exists("Images/DVG Segment Plots - combined"))
+  dir.create("Images/DVG Segment Plots - combined", recursive = TRUE)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_support_log.png",
+       combined_sup, width=16, height=8, dpi=300)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_support_log.svg",
+       combined_sup, width=16, height=8, dpi=300)
+
+
+```
+
+
+By fraction of support
+```{r}
+## ============================================================
+## DVG line plots: BP / RI on x, fraction of DVG reads per sample
+## ============================================================
+
+# List of segments and their approximate plotting x limits
+segs  <- c("PB1", "PB2", "PA", "HA", "NP", "NR", "M", "NS")
+xlims <- c(2285, 2284, 2183, 1717, 1506, 1426,  985,  847)
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+# Segment genomic coordinates (start, end)
+segment_ends <- list(
+  PB1 = c(1, 2341),
+  PB2 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+
+dvg_filt <- dvg %>%
+  filter(
+    !is.na(BP),
+    !is.na(RI),
+    length_dvg > 0,
+    mean_read_counts >= min_support
+  )
+
+
+# Compute total DVG support per sample
+sample_total_support <- dvg_filt %>%
+  group_by(SampleID) %>%
+  summarise(total_support = sum(mean_read_counts), .groups="drop")
+
+# Add fractional support to dvg_filt
+dvg_filt <- dvg_filt %>%
+  left_join(sample_total_support, by = "SampleID") %>%
+  mutate(
+    frac_support = mean_read_counts / total_support
+  )
+
+# dvg_filt now contains frac_support
+
+for (i in seq_along(segs)) {
+
+  segment  <- segs[i]
+  xlim_max <- xlims[i]
+
+  df1 <- dvg_filt %>% filter(Segment == segment)
+
+  if (nrow(df1) == 0) {
+    message("No DVGs for segment ", segment, ", skipping.")
+    next
+  }
+
+  if (!is.finite(y_max) || y_max <= 0) next
+
+  delheight <- 0.01
+  delwidth  <- 0.7
+
+  dummy_data <- expand.grid(
+    SampleID   = "dummy",
+    Sex        = "X",
+    HostStrain = "Dummy",
+    Host       = names(colors),
+    Treatment  = "Dummy",
+    Type       = "Dummy",
+    Line       = "Dummy",
+    Virulence  = 0,
+    TCID50     = 0,
+    Copy.Number = 0,
+    npoly      = 0,
+    Nei_D      = 0,
+    geneDiv    = 0,
+    Segment    = segment,
+    BP         = 1,
+    RI         = 2,
+    frac_support = 0
+  )
+
+  df1_plot <- bind_rows(df1, dummy_data)
+
+  seg_start <- segment_ends[[segment]][1]
+  seg_end   <- segment_ends[[segment]][2]
+
+  p <- ggplot(df1_plot, aes(color = Host)) +
+
+    # Segment start → BP
+    geom_segment(aes(x=seg_start, xend=BP, 
+                     y=frac_support, yend=frac_support),
+                 linewidth=0.2, linetype="dotted") +
+
+    # Tick at BP
+    geom_segment(aes(x=BP, xend=BP,
+                     y=frac_support - delheight,
+                     yend=frac_support + delheight),
+                 linewidth=delwidth) +
+
+    # BP → RI (hidden line)
+    geom_segment(aes(x=BP, xend=RI,
+                     y=frac_support, yend=frac_support),
+                 linewidth=0.2, alpha=0) +
+
+    # Tick at RI
+    geom_segment(aes(x=RI, xend=RI,
+                     y=frac_support - delheight,
+                     yend=frac_support + delheight),
+                 linewidth=delwidth) +
+
+    # RI → segment end
+    geom_segment(aes(x=RI, xend=seg_end,
+                     y=frac_support, yend=frac_support),
+                 linewidth=0.2, linetype="dotted") +
+    
+    annotate(
+    "text",
+    x = seg_start + (seg_end - seg_start) / 2,   # centered horizontally
+    y = 0.48,                                     # just below top of axis
+    label = segment,
+    size = 7,
+    fontface = "bold",
+    color = "black"
+  ) +
+
+    scale_color_manual(values=colors, drop=FALSE) +
+
+    coord_cartesian(
+      xlim = c(seg_start, seg_end),
+      expand = FALSE
+    ) +
+
+    scale_x_continuous(breaks = seq(0, seg_end, by=250)) +
+    scale_y_continuous(limits = c(0, 0.5), breaks = seq(0, 0.5, by = 0.1), expand = c(0, 0))+
+
+    theme_minimal() +
+    theme(
+      plot.margin      = unit(c(1, 1, 2, 1), "lines"),
+      panel.background = element_rect(fill="white", colour=NA),
+      plot.background  = element_rect(fill="white", colour=NA),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position  = "none",
+      axis.text        = element_text(size=16, color="black"),
+      axis.title       = element_text(size=20, face="bold", color="black"),
+      axis.title.x     = element_text(vjust=-1),
+      axis.title.y     = element_text(vjust=+2),
+      axis.ticks       = element_line(color="black", linewidth=1),
+      axis.ticks.length = unit(.25, "cm"),
+      axis.line        = element_line(color="black", linewidth=1)
+    ) +
+    labs(
+      x = "Genomic position",
+      y = "Fraction of DVG reads"
+    )
+
+  ggsave(paste0("Images/DVG Segment Plots - Fraction/DVGlines_", segment, ".png"),
+         p, width=8, height=5, dpi=300)
+
+  ggsave(paste0("Images/DVG Segment Plots - Fraction/DVGlines_", segment, ".svg"),
+         p, width=8, height=5, dpi=300, device="svg")
+}
+
+```
+
+All segments in one graph
+
+```{r}
+###########################################
+# All segments in one graph
+###########################################
+segment_order <- c("PB2", "PB1", "PA", "HA", "NP", "NR", "M", "NS")
+
+segment_ends <- list(
+  PB1 = c(1, 2341),
+  PB2 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+colors <- c(
+  "BALBF"="#F94040",
+  "BALBM"="#0000FF",
+  "BL6F" ="#C5944E",
+  "BL6M" ="#0F99B2"
+)
+
+###########################################
+# Build full plotting df for ALL segments
+###########################################
+
+tick_height <- 0.01
+tick_width  <- 0.7
+
+full_plot_df <- lapply(segment_order, function(seg) {
+  seg_start <- segment_ends[[seg]][1]
+  seg_end   <- segment_ends[[seg]][2]
+
+  df <- dvg_filt %>% filter(Segment == seg)
+  if (nrow(df) == 0) return(NULL)
+
+  df$seg_start <- seg_start
+  df$seg_end   <- seg_end
+  df
+}) %>%
+  bind_rows()
+
+###########################################
+# Enforce Segment ordering
+###########################################
+full_plot_df$Segment <- factor(full_plot_df$Segment,
+                               levels = segment_order)
+
+###########################################
+# PLOTTING
+###########################################
+
+p <- ggplot(full_plot_df, aes(color = Host)) +
+
+  geom_segment(aes(x = seg_start, xend = BP,
+                   y = frac_support, yend = frac_support),
+               linewidth = 0.2, linetype = "dotted") +
+
+  geom_segment(aes(x = BP, xend = BP,
+                   y = frac_support - tick_height,
+                   yend = frac_support + tick_height),
+               linewidth = tick_width) +
+
+  geom_segment(aes(x = BP, xend = RI,
+                   y = frac_support, yend = frac_support),
+               alpha = 0) +
+
+  geom_segment(aes(x = RI, xend = RI,
+                   y = frac_support - tick_height,
+                   yend = frac_support + tick_height),
+               linewidth = tick_width) +
+
+  geom_segment(aes(x = RI, xend = seg_end,
+                   y = frac_support, yend = frac_support),
+               linewidth = 0.2, linetype = "dotted") +
+
+  scale_color_manual(values = colors) +
+
+  facet_wrap(~Segment, nrow = 1, scales = "free_x") +
+
+  scale_y_continuous(
+    limits = c(0, 0.5),
+    breaks = seq(0, 0.5, by = 0.1),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    x = "Genomic position",
+    y = "Fractional of DVG reads"
+  ) +
+
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 18, face = "bold"),
+    axis.text  = element_text(size = 14, color = "black"),
+    axis.title = element_text(size = 18, face = "bold"),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black")
+  )
+
+p
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_facet.png",
+       p, width = 18, height = 6, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_facet.svg",
+       p, width = 18, height = 6, dpi = 300)
+```
+
+
+Combined segments - genome painted
+```{r}
+############################################
+# Segment ordering (largest → smallest)
+############################################
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1,2341),
+  PB1 = c(1,2341),
+  PA  = c(1,2233),
+  HA  = c(1,1778),
+  NP  = c(1,1565),
+  NR  = c(1,1433),
+  M   = c(1,1027),
+  NS  = c(1, 890)
+)
+
+colors <- c(
+  "BALBF"="#F94040",
+  "BALBM"="#0000FF",
+  "BL6F" ="#C5944E",
+  "BL6M" ="#0F99B2"
+)
+
+tick_height <- 0.01
+tick_width  <- 0.7
+
+
+#######################################################
+# Function to draw ONE segment panel (whole genome fraction)
+#######################################################
+plot_segment <- function(df_seg, seg_name, is_first=FALSE){
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  sec_breaks <- seq(250, seg_end - 250, by = 500)
+
+  ggplot(df_seg, aes(color = Host)) +
+
+    # start → BP
+    geom_segment(aes(
+      x = seg_start, xend = BP,
+      y = frac_support, yend = frac_support
+    ),
+    linewidth = 0.4, linetype = "dotted", alpha =0.5) +
+
+    # BP tick
+    geom_segment(aes(
+      x = BP, xend = BP,
+      y = frac_support - tick_height,
+      yend = frac_support + tick_height
+    ),
+    linewidth = tick_width, lineend = "butt",alpha=0.6) +
+
+    # BP → RI (invisible)
+    geom_segment(aes(
+      x = BP, xend = RI,
+      y = frac_support, yend = frac_support
+    ),
+    alpha = 0) +
+
+    # RI tick
+    geom_segment(aes(
+      x = RI, xend = RI,
+      y = frac_support - tick_height,
+      yend = frac_support + tick_height
+    ),
+    linewidth = tick_width, lineend = "butt",alpha=0.6) +
+
+    # RI → end
+    geom_segment(aes(
+      x = RI, xend = seg_end,
+      y = frac_support, yend = frac_support
+    ),
+    linewidth = 0.4, linetype = "dotted", alpha=0.5) +
+
+    scale_color_manual(values = colors) +
+
+    scale_x_continuous(
+      limits = c(seg_start, seg_end),
+      breaks = seq(0, seg_end, 500),
+      minor_breaks = sec_breaks,
+      expand = c(0,0)
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, 0.5),
+      breaks = seq(0, 0.5, 0.1),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (is_first) "Fraction of DVG reads" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+
+      axis.text.x  = element_text(size = 12, color = "black"),
+      axis.title.x = element_text(size = 14, face = "bold"),
+
+      # y-axis ONLY for PB2
+      axis.line.y  = if(is_first) element_line(color="black", linewidth=1) else element_blank(),
+      axis.ticks.y = if(is_first) element_line(color="black") else element_blank(),
+      axis.text.y  = if(is_first) element_text(size=12, color="black") else element_blank(),
+      axis.title.y = if(is_first) element_text(size=14, face="bold") else element_blank(),
+
+      # x-axis always visible
+      axis.line.x  = element_line(color="black", linewidth=1),
+      axis.ticks.x = element_line(color="black"),
+      axis.ticks.length = unit(4, "pt")
+    )
+}
+
+
+#######################################################
+# Build master dataframe for all segments
+#######################################################
+full_plot_df <- bind_rows(lapply(segment_order, function(seg) {
+
+  seg_start <- segment_ends[[seg]][1]
+  seg_end   <- segment_ends[[seg]][2]
+
+  df <- dvg_filt %>% filter(Segment == seg)
+  if(nrow(df) == 0) return(NULL)
+
+  df$seg_start <- seg_start
+  df$seg_end   <- seg_end
+
+  df
+}))
+
+
+#######################################################
+# Create one plot per segment
+#######################################################
+plots <- lapply(seq_along(segment_order), function(i){
+  seg <- segment_order[i]
+  df_seg <- full_plot_df %>% filter(Segment == seg)
+  plot_segment(df_seg, seg, is_first = (i == 1))
+})
+
+
+#######################################################
+# Combine with proportional widths
+#######################################################
+segment_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+relative_widths <- segment_lengths[segment_order] / sum(segment_lengths)
+
+combined <- wrap_plots(plots, nrow = 1, widths = relative_widths)
+
+
+#######################################################
+# Save output
+#######################################################
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_final.png",
+       combined, width = 18, height = 6, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_final.svg",
+       combined, width = 18, height = 6, dpi = 300)
+
+```
+
+
+SAME AS ABOVE, deletion painted
+```{r}
+############################################
+# Segment ordering (largest → smallest)
+############################################
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1,2341),
+  PB1 = c(1,2341),
+  PA  = c(1,2233),
+  HA  = c(1,1778),
+  NP  = c(1,1565),
+  NR  = c(1,1433),
+  M   = c(1,1027),
+  NS  = c(1, 890)
+)
+
+colors <- c(
+  "BALBF"="#F94040",
+  "BALBM"="#0000FF",
+  "BL6F" ="#C5944E",
+  "BL6M" ="#0F99B2"
+)
+
+tick_height <- 0.01
+tick_width  <- 0.7
+
+
+#######################################################
+# Function to draw ONE segment panel (whole genome fraction)
+#######################################################
+plot_segment <- function(df_seg, seg_name, is_first=FALSE){
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  sec_breaks <- seq(250, seg_end - 250, by = 500)
+
+  ggplot(df_seg, aes(color = Host)) +
+
+    # start → BP #(invisible)
+    geom_segment(aes(
+      x = seg_start, xend = BP,
+      y = frac_support, yend = frac_support
+    ),
+    alpha =0) + 
+
+    # BP tick
+    geom_segment(aes(
+      x = BP, xend = BP,
+      y = frac_support - tick_height,
+      yend = frac_support + tick_height
+    ),
+    linewidth = tick_width, lineend = "butt",alpha=0.7) +
+
+    # BP → RI 
+    geom_segment(aes(
+      x = BP, xend = RI,
+      y = frac_support, yend = frac_support
+    ),
+    linewidth = 0.4, linetype = "dotted", alpha = 0.5) +
+
+    # RI tick
+    geom_segment(aes(
+      x = RI, xend = RI,
+      y = frac_support - tick_height,
+      yend = frac_support + tick_height
+    ),
+    linewidth = tick_width, lineend = "butt",alpha=0.7) +
+
+    # RI → end #(invisible)
+    geom_segment(aes(
+      x = RI, xend = seg_end,
+      y = frac_support, yend = frac_support
+    ),
+    alpha=0) +
+
+    scale_color_manual(values = colors) +
+
+    scale_x_continuous(
+      limits = c(seg_start, seg_end),
+      breaks = seq(0, seg_end, 500),
+      minor_breaks = sec_breaks,
+      expand = c(0,0)
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, 0.5),
+      breaks = seq(0, 0.5, 0.1),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (is_first) "Fraction of DVG reads" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+
+      axis.text.x  = element_text(size = 12, color = "black"),
+      axis.title.x = element_text(size = 14, face = "bold"),
+
+      # y-axis ONLY for PB2
+      axis.line.y  = if(is_first) element_line(color="black", linewidth=1) else element_blank(),
+      axis.ticks.y = if(is_first) element_line(color="black") else element_blank(),
+      axis.text.y  = if(is_first) element_text(size=12, color="black") else element_blank(),
+      axis.title.y = if(is_first) element_text(size=14, face="bold") else element_blank(),
+
+      # x-axis always visible
+      axis.line.x  = element_line(color="black", linewidth=1),
+      axis.ticks.x = element_line(color="black"),
+      axis.ticks.length = unit(4, "pt")
+    )
+}
+
+
+#######################################################
+# Build master dataframe for all segments
+#######################################################
+full_plot_df <- bind_rows(lapply(segment_order, function(seg) {
+
+  seg_start <- segment_ends[[seg]][1]
+  seg_end   <- segment_ends[[seg]][2]
+
+  df <- dvg_filt %>% filter(Segment == seg)
+  if(nrow(df) == 0) return(NULL)
+
+  df$seg_start <- seg_start
+  df$seg_end   <- seg_end
+
+  df
+}))
+
+
+#######################################################
+# Create one plot per segment
+#######################################################
+plots <- lapply(seq_along(segment_order), function(i){
+  seg <- segment_order[i]
+  df_seg <- full_plot_df %>% filter(Segment == seg)
+  plot_segment(df_seg, seg, is_first = (i == 1))
+})
+
+
+#######################################################
+# Combine with proportional widths
+#######################################################
+segment_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+relative_widths <- segment_lengths[segment_order] / sum(segment_lengths)
+
+combined <- wrap_plots(plots, nrow = 1, widths = relative_widths)
+
+
+#######################################################
+# Save output
+#######################################################
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_delpainted.png",
+       combined, width = 18, height = 6, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_delpainted.svg",
+       combined, width = 18, height = 6, dpi = 300)
+
+```
+
+
+```{r}
+########################################################
+## FRACTIONAL SUPPORT PLOTS — HOSTS SEPARATED       
+########################################################
+
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1,2341),
+  PB1 = c(1,2341),
+  PA  = c(1,2233),
+  HA  = c(1,1778),
+  NP  = c(1,1565),
+  NR  = c(1,1433),
+  M   = c(1,1027),
+  NS  = c(1, 890)
+)
+
+colors <- c(
+  "BALBF"="#F94040",
+  "BALBM"="#0000FF",
+  "BL6F" ="#C5944E",
+  "BL6M" ="#0F99B2"
+)
+
+tick_height <- 0.01
+tick_width  <- 0.7
+
+
+########################################################
+## FUNCTION: ONE SEGMENT PANEL
+########################################################
+plot_segment_host <- function(df_seg, seg_name, first_seg){
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+  sec_breaks <- seq(250, seg_end - 250, by = 500)
+
+  ggplot(df_seg, aes(color = Host)) +
+
+    geom_segment(aes(x = seg_start, xend = BP,
+                     y = frac_support, yend = frac_support),
+                 linewidth = 0.2, linetype = "dotted") +
+
+    geom_segment(aes(x = BP, xend = BP,
+                     y = frac_support - tick_height,
+                     yend = frac_support + tick_height),
+                 linewidth = tick_width) +
+
+    geom_segment(aes(x = BP, xend = RI,
+                     y = frac_support, yend = frac_support),
+                 alpha = 0) +
+
+    geom_segment(aes(x = RI, xend = RI,
+                     y = frac_support - tick_height,
+                     yend = frac_support + tick_height),
+                 linewidth = tick_width) +
+
+    geom_segment(aes(x = RI, xend = seg_end,
+                     y = frac_support, yend = frac_support),
+                 linewidth = 0.2, linetype = "dotted") +
+
+    scale_color_manual(values = colors) +
+
+    scale_x_continuous(
+      limits = c(seg_start, seg_end),
+      breaks = seq(0, seg_end, 500),
+      minor_breaks = sec_breaks,
+      expand = c(0,0)
+    ) +
+    scale_y_continuous(
+      limits = c(0,0.5),
+      breaks = seq(0,0.5,0.1),
+      expand = c(0,0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if(first_seg) "Fraction DVG reads" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+
+      axis.text.x  = element_text(size = 12, color = "black"),
+      axis.title.x = element_text(size = 13, face = "bold"),
+
+      # only PB2 gets y axis
+      axis.line.y  = if(first_seg) element_line(color="black") else element_blank(),
+      axis.ticks.y = if(first_seg) element_line(color="black") else element_blank(),
+      axis.text.y  = if(first_seg) element_text(size=12, color="black") else element_blank(),
+      axis.title.y = if(first_seg) element_text(size=14, face="bold") else element_blank(),
+
+      axis.line.x  = element_line(color="black"),
+      axis.ticks.x = element_line(color="black"),
+      axis.ticks.length = unit(4, "pt")
+    )
+}
+
+
+########################################################
+## FUNCTION: FULL HOST PANEL (8 SEGMENTS)
+########################################################
+
+plot_one_host <- function(df_host){
+
+  seg_plots <- lapply(seq_along(segment_order), function(i){
+
+    seg <- segment_order[i]
+    df_seg <- df_host %>% filter(Segment == seg)
+
+    if(nrow(df_seg)==0){
+      return(ggplot() + theme_void())
+    }
+
+    plot_segment_host(df_seg, seg, first_seg = (i==1))
+  })
+
+  segment_lengths <- sapply(segment_ends, function(x) x[2]-x[1])
+  relative_widths <- segment_lengths[segment_order] / sum(segment_lengths)
+
+  wrap_plots(seg_plots, nrow = 1, widths = relative_widths)
+}
+
+
+########################################################
+## PREP DATA: full_plot_df MUST EXIST
+########################################################
+## (Your earlier pipeline already created dvg_filt
+##  and full_plot_df; just make sure frac_support exists.)
+
+## For safety:
+stopifnot("frac_support" %in% colnames(full_plot_df))
+
+
+########################################################
+## GENERATE FOUR HOST PANELS
+########################################################
+
+hosts <- c("BALBF","BALBM","BL6F","BL6M")
+
+p_list <- list()
+
+for(h in hosts){
+
+  df_host <- full_plot_df %>% filter(Host == h)
+
+  if(nrow(df_host)==0){
+    message("Skipping ", h)
+    p_list[[h]] <- ggplot() + theme_void()
+    next
+  }
+
+  p_host <- plot_one_host(df_host)
+
+  # store in list
+  p_list[[h]] <- p_host
+
+  # save individual
+  ggsave(
+    paste0("Images/DVG Segment Plots - byHost/DVG_", h, "_fractional.png"),
+    p_host, width = 18, height = 5, dpi = 300
+  )
+    ggsave(
+    paste0("Images/DVG Segment Plots - byHost/DVG_", h, "_fractional.svg"),
+    p_host, width = 18, height = 5, dpi = 300
+  )
+}
+
+# Assign to variables for final stacking
+p_BALBF <- p_list[["BALBF"]]
+p_BALBM <- p_list[["BALBM"]]
+p_BL6F  <- p_list[["BL6F"]]
+p_BL6M  <- p_list[["BL6M"]]
+
+
+########################################################
+## STACKED FIGURE (ONLY BL6M HAS LEGEND)
+########################################################
+
+stacked <- 
+  (p_BALBF + theme(legend.position="none")) /
+  (p_BALBM + theme(legend.position="none")) /
+  (p_BL6F  + theme(legend.position="none")) /
+  (p_BL6M + theme(legend.position="none")) +
+  plot_layout(heights = c(1,1,1,1.2))
+
+ggsave("Images/DVG Segment Plots - combined/DVG_stacked_hosts.png",
+       stacked, width = 18, height = 10, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_stacked_hosts.svg",
+       stacked, width = 18, height = 10, dpi = 300)
+
+```
+
+DVGS PER SEGMENT, FRACTIONAL SUPPORT PER SEGMENT (INSTEAD OF TOTAL)
+
+```{r}
+###############################################################
+## Compute fractional support *within each segment per sample*
+###############################################################
+
+dvg_frac <- dvg_filt %>%
+  group_by(SampleID, Segment) %>%
+  mutate(
+    segment_total_support = sum(mean_read_counts, na.rm = TRUE),
+    frac_support_segment  = mean_read_counts / segment_total_support
+  ) %>%
+  ungroup()
+
+###############################################
+## 1. SEPARATE FRACTIONAL SUPPORT PLOTS
+###############################################
+
+for (segment in segs) {
+
+  df1 <- dvg_frac %>% filter(Segment == segment)
+  if (nrow(df1) == 0) next
+
+  seg_start <- segment_ends[[segment]][1]
+  seg_end   <- segment_ends[[segment]][2]
+
+  delheight <- 0.01
+  delwidth  <- 0.7
+
+  # Dummy rows so all Hosts appear in legend/colors
+  dummy_data <- expand.grid(
+    SampleID="dummy",
+    Host=names(colors),
+    Segment=segment,
+    BP=seg_start,
+    RI=seg_start+1,
+    frac_support_segment=0
+  )
+
+  df1_plot <- bind_rows(df1, dummy_data)
+
+  p <- ggplot(df1_plot, aes(color = Host)) +
+
+    geom_segment(aes(x=seg_start, xend=BP,
+                     y=frac_support_segment, yend=frac_support_segment),
+                 linewidth=0.2, linetype="dotted") +
+
+    geom_segment(aes(x=BP, xend=BP,
+                     y=frac_support_segment - delheight,
+                     yend=frac_support_segment + delheight),
+                 linewidth=delwidth) +
+
+    geom_segment(aes(x=RI, xend=RI,
+                     y=frac_support_segment - delheight,
+                     yend=frac_support_segment + delheight),
+                 linewidth=delwidth) +
+
+    geom_segment(aes(x=RI, xend=seg_end,
+                     y=frac_support_segment, yend=frac_support_segment),
+                 linewidth=0.2, linetype="dotted") +
+
+    annotate("text",
+             x = seg_start + (seg_end - seg_start)/2,
+             y = 0.48,
+             label = segment,
+             size = 7, fontface = "bold") +
+
+    scale_color_manual(values = colors) +
+
+    scale_x_continuous(limits = c(seg_start, seg_end),
+                       breaks = seq(0, seg_end, 250),
+                       expand = c(0,0)) +
+
+    scale_y_continuous(limits=c(0,1),
+                       breaks=seq(0,1,0.1),
+                       expand=c(0,0)) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text  = element_text(size=16),
+      axis.title = element_text(size=20, face="bold"),
+      legend.position="none",
+      axis.line = element_line(color="black"),
+      axis.ticks = element_line(color="black")
+    ) +
+    labs(
+      x = "Genomic position",
+      y = "Fraction of DVG reads"
+    )
+
+  ggsave(paste0("Images/DVG Fraction per Segment/DVGlines_frac_", segment, ".png"),
+         p, width=8, height=5, dpi=300)
+  ggsave(paste0("Images/DVG Fraction per Segment/DVGlines_frac_", segment, ".svg"),
+         p, width=8, height=5, dpi=300)
+}
+
+###############################################
+## 2. COMBINED FRACTIONAL SUPPORT PLOT
+###############################################
+
+library(patchwork)
+
+segment_order <- segs
+
+# Build combined DF
+full_plot_df <- bind_rows(lapply(segment_order, function(seg) {
+  df <- dvg_frac %>% filter(Segment == seg)
+  if (nrow(df)==0) return(NULL)
+  df$seg_start <- segment_ends[[seg]][1]
+  df$seg_end   <- segment_ends[[seg]][2]
+  df
+}))
+
+full_plot_df$Segment <- factor(full_plot_df$Segment,
+                               levels = segment_order)
+
+plot_seg_frac <- function(df_seg, seg_name, first=FALSE){
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  th <- 0.01   # tick half-height
+  tw <- 0.7    # tick width
+
+  ggplot(df_seg, aes(color=Host)) +
+    geom_segment(aes(x=seg_start, xend=BP,
+                     y=frac_support_segment, yend=frac_support_segment),
+                 linewidth=0.2, linetype="dotted") +
+
+    geom_segment(aes(x=BP, xend=BP,
+                     y=frac_support_segment - th,
+                     yend=frac_support_segment + th),
+                 linewidth=tw) +
+
+    geom_segment(aes(x=RI, xend=RI,
+                     y=frac_support_segment - th,
+                     yend=frac_support_segment + th),
+                 linewidth=tw) +
+
+    geom_segment(aes(x=RI, xend=seg_end,
+                     y=frac_support_segment, yend=frac_support_segment),
+                 linewidth=0.2, linetype="dotted") +
+
+    scale_color_manual(values = colors) +
+
+    scale_x_continuous(
+      limits  = c(seg_start, seg_end),
+      breaks  = seq(0, seg_end, 500),
+      expand  = c(0,0)
+    ) +
+
+    scale_y_continuous(
+      limits  = c(0, 1),
+      breaks  = seq(0, 1, 0.1),
+      expand  = c(0,0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (first) "Fraction of DVG reads" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+
+      axis.text.x  = element_text(size=12, color="black"),
+      axis.title.x = element_text(size=14, face="bold"),
+
+      # y-axis only visible on first panel
+      axis.line.y  = if(first) element_line(color="black", linewidth=1) else element_blank(),
+      axis.ticks.y = if(first) element_line(color="black") else element_blank(),
+      axis.text.y  = if(first) element_text(size=12, color="black") else element_blank(),
+      axis.title.y = if(first) element_text(size=14, face="bold") else element_blank(),
+
+      # x-axis always ON
+      axis.line.x  = element_line(color="black", linewidth=1),
+      axis.ticks.x = element_line(color="black"),
+
+      axis.ticks.length = unit(4, "pt")
+    )
+}
+
+plots <- lapply(seq_along(segment_order), function(i){
+  seg <- segment_order[i]
+  df_seg <- full_plot_df %>% filter(Segment==seg)
+  plot_seg_frac(df_seg, seg, first=(i==1))
+})
+
+segment_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+relative_widths <- segment_lengths[segment_order] / sum(segment_lengths)
+
+combined_frac <- wrap_plots(plots, nrow=1, widths=relative_widths)
+
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_fraction.png",
+       combined_frac, width=18, height=6, dpi=300)
+ggsave("Images/DVG Segment Plots - combined/DVG_all_segments_fraction.svg",
+       combined_frac, width=18, height=6, dpi=300)
+
+```
+___________________________
+___________________________
+___GOOD, THIS IS THE ONE___
+___________________________
+___________________________
+DVG HILLS SEPARATED BY HOST, Y axis is each Species, counted and stacked.
+
+```{r}
+############################################################
+## 1. SETTINGS
+############################################################
+
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1, 2341),
+  PB1 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+host_order <- c("BALBF","BALBM","BL6F","BL6M")
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+y_max_stack <- 420   # fixed y limit
+
+############################################################
+## 2. PREP DATA FOR STACKED PLOT
+############################################################
+# dvg_filt is assumed to exist in your environment
+
+dvg_stack <- dvg_filt %>%
+  filter(!is.na(Segment),
+         Segment %in% segment_order,
+         !is.na(BP),
+         !is.na(RI)) %>%
+  mutate(
+    Segment = factor(Segment, levels = segment_order),
+    Host    = factor(Host,    levels = host_order),
+    del_len = abs(RI - BP)
+  ) %>%
+  # one row per unique DVG within Segment/Host
+  group_by(Segment, Host, cID_DI) %>%
+  summarise(
+    BP      = first(BP),
+    RI      = first(RI),
+    del_len = first(del_len),
+    .groups = "drop"
+  ) %>%
+  group_by(Segment, Host) %>%
+  arrange(desc(del_len), .by_group = TRUE) %>%
+  mutate(stack_y = row_number()) %>%
+  ungroup()
+
+############################################################
+## 3. FUNCTION: ONE SEGMENT, 4 HOST PANELS SIDE BY SIDE
+############################################################
+
+plot_segment_hosts <- function(seg_name, show_y = FALSE) {
+
+  df_seg <- dvg_stack %>% filter(Segment == seg_name)
+  if (nrow(df_seg) == 0) return(ggplot() + theme_void())
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  ggplot(df_seg, aes(color = Host)) +
+    # start → BP (genome, hidden)
+    geom_segment(aes(x = seg_start, xend = BP,
+                     y = stack_y,    yend = stack_y),
+                 linewidth = 0.1, alpha = 0.3, linetype = "solid") +
+    # BP tick
+    geom_segment(aes(x = BP, xend = BP,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # BP → RI (deletion)
+    geom_segment(aes(x = BP, xend = RI,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.1, alpha = 1, linetype = "solid") +
+    # RI tick
+    geom_segment(aes(x = RI, xend = RI,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # RI → end (genome, hidden)
+    geom_segment(aes(x = RI, xend = seg_end,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.1, alpha = 0.3, linetype = "solid") +
+
+    facet_wrap(~ Host, nrow = 1, strip.position = "bottom") +
+    theme(
+      strip.text       = element_blank(),
+      strip.background = element_blank()
+    ) +
+
+    scale_color_manual(values = colors, drop = FALSE) +
+    (
+      {
+        seg_len <- seg_end - seg_start
+
+        if (seg_len < 1600) {
+          # short segments → one tick at 500
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = 500,
+            minor_breaks = NULL,
+            expand = c(0, 0)
+          )
+        } else {
+          # long segments → usual ticks
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = seq(500, seg_end, by = 1000),
+            minor_breaks = seq(0, seg_end, by = 250),
+            expand = c(0, 0)
+          )
+        }
+      }
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, y_max_stack),
+      breaks = seq(0, y_max_stack, by = 100),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (show_y) "Unique DVGs" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid      = element_blank(),
+      legend.position = "none",
+      panel.spacing.x = unit(0.1, "lines"),   # hosts close together
+
+      axis.text.x  = element_text(size = 7, color = "black"),
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.line.x  = element_line(color = "black"),
+      axis.ticks.x = element_line(size = 0.4, color = "black"),
+      axis.ticks.length.x = unit(3, "pt"),
+
+      axis.text.y  = if (show_y) element_text(size = 10, color = "black") else element_blank(),
+      axis.title.y = if (show_y) element_text(size = 14, face = "bold") else element_blank(),
+      axis.ticks.y = if (show_y) element_line(color = "black") else element_blank(),
+      axis.line.y  = if (show_y) element_line(color = "black") else element_blank(),
+
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+    ) +
+    theme(
+      strip.background.x = element_blank(),
+      strip.text.x       = element_blank(),
+      strip.background.y = element_blank(),
+      strip.text.y       = element_blank()
+    )
+}
+
+############################################################
+## 4. BUILD ALL SEGMENT PANELS AND COMBINE
+############################################################
+
+segment_plots <- lapply(seq_along(segment_order), function(i) {
+  seg <- segment_order[i]
+  show_y <- (i == 1)   # only PB2 shows y axis
+  plot_segment_hosts(seg, show_y = show_y)
+})
+
+# widen small segments a bit so there is visible space between segments
+seg_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+seg_lengths_padded <- seg_lengths[segment_order] + 1000
+relative_widths <- seg_lengths_padded / sum(seg_lengths_padded)
+
+final_plot <- wrap_plots(
+  segment_plots,
+  nrow   = 1,
+  widths = relative_widths
+)
+
+############################################################
+## 5. SAVE
+############################################################
+
+if (!dir.exists("Images/DVG Segment Plots - stacked"))
+  dir.create("Images/DVG Segment Plots - stacked", recursive = TRUE)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_byHost.png",
+       final_plot, width = 16, height = 8, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_byHost.svg",
+       final_plot, width = 16, height = 8, dpi = 300)
+
+```
+
+COLORED BACKGROUND
+
+```{r}
+############################################################
+## 1. SETTINGS
+############################################################
+
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1, 2341),
+  PB1 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+host_order <- c("BALBF","BALBM","BL6F","BL6M")
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+y_max_stack <- 420   # fixed y limit
+
+############################################################
+## 2. PREP DATA FOR STACKED PLOT
+############################################################
+# dvg_filt is assumed to exist in your environment
+
+dvg_stack <- dvg_filt %>%
+  filter(!is.na(Segment),
+         Segment %in% segment_order,
+         !is.na(BP),
+         !is.na(RI)) %>%
+  mutate(
+    Segment = factor(Segment, levels = segment_order),
+    Host    = factor(Host,    levels = host_order),
+    del_len = abs(RI - BP)
+  ) %>%
+  # one row per unique DVG within Segment/Host
+  group_by(Segment, Host, cID_DI) %>%
+  summarise(
+    BP      = first(BP),
+    RI      = first(RI),
+    del_len = first(del_len),
+    .groups = "drop"
+  ) %>%
+  group_by(Segment, Host) %>%
+  arrange(desc(del_len), .by_group = TRUE) %>%
+  mutate(stack_y = row_number()) %>%
+  ungroup()
+
+############################################################
+## 3. FUNCTION: ONE SEGMENT, 4 HOST PANELS SIDE BY SIDE
+############################################################
+
+plot_segment_hosts <- function(seg_name, show_y = FALSE) {
+
+  df_seg <- dvg_stack %>% filter(Segment == seg_name)
+  if (nrow(df_seg) == 0) return(ggplot() + theme_void())
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  ggplot(df_seg, aes(color = Host)) +
+    # start → BP (genome, hidden)
+    geom_segment(aes(x = seg_start, xend = BP,
+                     y = stack_y,    yend = stack_y),
+                 linewidth = 0.2, alpha = 0.8, linetype = "solid") +
+    # BP tick
+    geom_segment(aes(x = BP, xend = BP,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # BP → RI (deletion)
+    geom_segment(aes(x = BP, xend = RI,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.2, alpha = 0.2, linetype = "solid") +
+    # RI tick
+    geom_segment(aes(x = RI, xend = RI,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # RI → end (genome, hidden)
+    geom_segment(aes(x = RI, xend = seg_end,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.2, alpha = 0.8, linetype = "solid") +
+
+    facet_wrap(~ Host, nrow = 1, strip.position = "bottom") +
+    theme(
+      strip.text       = element_blank(),
+      strip.background = element_blank()
+    ) +
+
+    scale_color_manual(values = colors, drop = FALSE) +
+    (
+      {
+        seg_len <- seg_end - seg_start
+
+        if (seg_len < 1600) {
+          # short segments → one tick at 500
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = 500,
+            minor_breaks = NULL,
+            expand = c(0, 0)
+          )
+        } else {
+          # long segments → usual ticks
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = seq(500, seg_end, by = 1000),
+            minor_breaks = seq(0, seg_end, by = 250),
+            expand = c(0, 0)
+          )
+        }
+      }
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, y_max_stack),
+      breaks = seq(0, y_max_stack, by = 100),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (show_y) "Unique DVGs" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid      = element_blank(),
+      legend.position = "none",
+      panel.spacing.x = unit(0.1, "lines"),   # hosts close together
+
+      axis.text.x  = element_text(size = 7, color = "black"),
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.line.x  = element_line(color = "black"),
+      axis.ticks.x = element_line(size = 0.4, color = "black"),
+      axis.ticks.length.x = unit(3, "pt"),
+
+      axis.text.y  = if (show_y) element_text(size = 10, color = "black") else element_blank(),
+      axis.title.y = if (show_y) element_text(size = 14, face = "bold") else element_blank(),
+      axis.ticks.y = if (show_y) element_line(color = "black") else element_blank(),
+      axis.line.y  = if (show_y) element_line(color = "black") else element_blank(),
+
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+    ) +
+    theme(
+      strip.background.x = element_blank(),
+      strip.text.x       = element_blank(),
+      strip.background.y = element_blank(),
+      strip.text.y       = element_blank()
+    )
+}
+
+############################################################
+## 4. BUILD ALL SEGMENT PANELS AND COMBINE
+############################################################
+
+segment_plots <- lapply(seq_along(segment_order), function(i) {
+  seg <- segment_order[i]
+  show_y <- (i == 1)   # only PB2 shows y axis
+  plot_segment_hosts(seg, show_y = show_y)
+})
+
+# widen small segments a bit so there is visible space between segments
+seg_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+seg_lengths_padded <- seg_lengths[segment_order] + 1000
+relative_widths <- seg_lengths_padded / sum(seg_lengths_padded)
+
+final_plot <- wrap_plots(
+  segment_plots,
+  nrow   = 1,
+  widths = relative_widths
+)
+
+############################################################
+## 5. SAVE
+############################################################
+
+if (!dir.exists("Images/DVG Segment Plots - stacked"))
+  dir.create("Images/DVG Segment Plots - stacked", recursive = TRUE)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_reversed.png",
+       final_plot, width = 16, height = 8, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_reversed.svg",
+       final_plot, width = 16, height = 8, dpi = 300)
+```
+
+
+ONLY ALTERNATE DELETION TYPES TO SEE WHAT THEY LOOK LIKE
+
+```{r}
+############################################################
+## 1. SETTINGS
+############################################################
+
+segment_order <- c("PB2","PB1","PA","HA","NP","NR","M","NS")
+
+segment_ends <- list(
+  PB2 = c(1, 2341),
+  PB1 = c(1, 2341),
+  PA  = c(1, 2233),
+  HA  = c(1, 1778),
+  NP  = c(1, 1565),
+  NR  = c(1, 1433),
+  M   = c(1, 1027),
+  NS  = c(1,  890)
+)
+
+host_order <- c("BALBF","BALBM","BL6F","BL6M")
+
+colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+y_max_stack <- 420   # fixed y limit
+
+############################################################
+## 2. PREP DATA FOR STACKED PLOT
+############################################################
+# dvg_filt is assumed to exist in your environment
+
+dvg_stack <- dvg_filt %>%
+  filter(!is.na(Segment),
+         Segment %in% segment_order,
+         !is.na(BP),
+         !is.na(RI),
+         DVG_type != "Deletion_forward") %>%   # <-- FILTER OUT 3cb/sb HERE
+  mutate(
+    Segment = factor(Segment, levels = segment_order),
+    Host    = factor(Host,    levels = host_order),
+    del_len = abs(RI - BP)
+  ) %>%
+  # one row per unique DVG within Segment/Host
+  group_by(Segment, Host, cID_DI) %>%
+  summarise(
+    BP      = first(BP),
+    RI      = first(RI),
+    del_len = first(del_len),
+    .groups = "drop"
+  ) %>%
+  group_by(Segment, Host) %>%
+  arrange(desc(del_len), .by_group = TRUE) %>%
+  mutate(stack_y = row_number()) %>%
+  ungroup()
+
+############################################################
+## 3. FUNCTION: ONE SEGMENT, 4 HOST PANELS SIDE BY SIDE
+############################################################
+
+plot_segment_hosts <- function(seg_name, show_y = FALSE) {
+
+  df_seg <- dvg_stack %>% filter(Segment == seg_name)
+  if (nrow(df_seg) == 0) return(ggplot() + theme_void())
+
+  seg_start <- segment_ends[[seg_name]][1]
+  seg_end   <- segment_ends[[seg_name]][2]
+
+  ggplot(df_seg, aes(color = Host)) +
+    # start → BP (genome, hidden)
+    geom_segment(aes(x = seg_start, xend = BP,
+                     y = stack_y,    yend = stack_y),
+                 linewidth = 0.1, alpha = 0.3, linetype = "solid") +
+    # BP tick
+    geom_segment(aes(x = BP, xend = BP,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # BP → RI (deletion)
+    geom_segment(aes(x = BP, xend = RI,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.1, alpha = 1, linetype = "solid") +
+    # RI tick
+    geom_segment(aes(x = RI, xend = RI,
+                     y = stack_y - 1, yend = stack_y + 1),
+                 linewidth = 0.3, alpha = 1) +
+    # RI → end (genome, hidden)
+    geom_segment(aes(x = RI, xend = seg_end,
+                     y = stack_y, yend = stack_y),
+                 linewidth = 0.1, alpha = 0.3, linetype = "solid") +
+
+    facet_wrap(~ Host, nrow = 1, strip.position = "bottom") +
+    theme(
+      strip.text       = element_blank(),
+      strip.background = element_blank()
+    ) +
+
+    scale_color_manual(values = colors, drop = FALSE) +
+    (
+      {
+        seg_len <- seg_end - seg_start
+
+        if (seg_len < 1600) {
+          # short segments → one tick at 500
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = 500,
+            minor_breaks = NULL,
+            expand = c(0, 0)
+          )
+        } else {
+          # long segments → usual ticks
+          scale_x_continuous(
+            limits = c(seg_start, seg_end),
+            breaks = seq(500, seg_end, by = 1000),
+            minor_breaks = seq(0, seg_end, by = 250),
+            expand = c(0, 0)
+          )
+        }
+      }
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, y_max_stack),
+      breaks = seq(0, y_max_stack, by = 100),
+      expand = c(0, 0)
+    ) +
+
+    labs(
+      x = seg_name,
+      y = if (show_y) "Unique DVGs" else NULL
+    ) +
+
+    theme_minimal() +
+    theme(
+      panel.grid      = element_blank(),
+      legend.position = "none",
+      panel.spacing.x = unit(0.1, "lines"),   # hosts close together
+
+      axis.text.x  = element_text(size = 7, color = "black"),
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.line.x  = element_line(color = "black"),
+      axis.ticks.x = element_line(size = 0.4, color = "black"),
+      axis.ticks.length.x = unit(3, "pt"),
+
+      axis.text.y  = if (show_y) element_text(size = 10, color = "black") else element_blank(),
+      axis.title.y = if (show_y) element_text(size = 14, face = "bold") else element_blank(),
+      axis.ticks.y = if (show_y) element_line(color = "black") else element_blank(),
+      axis.line.y  = if (show_y) element_line(color = "black") else element_blank(),
+
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+    ) +
+    theme(
+      strip.background.x = element_blank(),
+      strip.text.x       = element_blank(),
+      strip.background.y = element_blank(),
+      strip.text.y       = element_blank()
+    )
+}
+
+############################################################
+## 4. BUILD ALL SEGMENT PANELS AND COMBINE
+############################################################
+
+segment_plots <- lapply(seq_along(segment_order), function(i) {
+  seg <- segment_order[i]
+  show_y <- (i == 1)   # only PB2 shows y axis
+  plot_segment_hosts(seg, show_y = show_y)
+})
+
+# widen small segments a bit so there is visible space between segments
+seg_lengths <- sapply(segment_ends, function(x) x[2] - x[1])
+seg_lengths_padded <- seg_lengths[segment_order] + 1000
+relative_widths <- seg_lengths_padded / sum(seg_lengths_padded)
+
+final_plot <- wrap_plots(
+  segment_plots,
+  nrow   = 1,
+  widths = relative_widths
+)
+
+############################################################
+## 5. SAVE
+############################################################
+
+if (!dir.exists("Images/DVG Segment Plots - stacked"))
+  dir.create("Images/DVG Segment Plots - stacked", recursive = TRUE)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_rare.png",
+       final_plot, width = 16, height = 8, dpi = 300)
+
+ggsave("Images/DVG Segment Plots - stacked/DVG_stacked_species_rare.svg",
+       final_plot, width = 16, height = 8, dpi = 300)
+
+```
+
+
+
+
+_____________________________
+_____________________________
+___SEPARATED TYPES OF DVGs___
+_____________________________
+
+
+DVG PER TYPE GRAPH WITH BARS, SAMPLES WITH NO DVGs NOT INCLUDED.
+```{r}
+
+# Compute mean per group (bar heights)
+bar_means <- dvg_type_counts %>%
+  group_by(DVG_type, Host) %>%
+  summarise(mean_n = mean(n), .groups="drop")
+
+# Order DVG types logically
+dvg_order <- c("Deletion_forward", "Deletion_reverse", "3cb/sb", "Insertion_forward")
+
+dvg_type_counts$DVG_type <- factor(dvg_type_counts$DVG_type, levels=dvg_order)
+bar_means$DVG_type       <- factor(bar_means$DVG_type,       levels=dvg_order)
+# Replace zeros for log plotting
+dvg_plot <- dvg_type_counts %>%
+  mutate(n_plot = ifelse(n == 0, 0.3, n))
+
+host_colors <- c(
+  "BALBF"="#F94040",
+  "BALBM"="#0000FF",
+  "BL6F" ="#C5944E",
+  "BL6M" ="#0F99B2"
+)
+
+dodge <- position_dodge(width = 0.7)
+
+p <- ggplot(dvg_plot, aes(x = DVG_type, y = n_plot, fill = Host)) +
+
+  # Mean bars (solid bars, fully visible)
+  geom_bar(
+    stat = "summary",
+    fun = "mean",
+    position = dodge,
+    width = 0.6,
+    alpha = 0.15          # transparent bars
+  ) +
+
+  # SE whiskers
+  geom_errorbar(
+    stat = "summary",
+    fun.data = mean_se,
+    position = dodge,
+    width = 0.4,
+    color = "black",
+    linewidth = 0.5
+  ) +
+
+  # Individual points
+  geom_jitter(
+    aes(color = Host),
+    position = position_jitterdodge(
+      jitter.width = 0.2,
+      dodge.width = 0.7
+    ),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  scale_fill_manual(values = host_colors) +
+  scale_color_manual(values = host_colors) +
+
+  # Log scale but show zero
+  scale_y_log10(
+    breaks = c(0.3, 1, 3, 10, 30, 100, 300),
+    labels = c("0", "1", "3", "10", "30", "100", "300")
+  ) +
+
+  labs(x = "", y = "Unique DVGs (log scale)") +
+
+  theme_minimal(base_size = 16) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color="black"),
+    legend.position = "none"
+  )
+
+p
+
+
+ggsave("Images/DVG_Types/DVGtype_grouped_meanSE_Bars.png",
+       p, width = 13, height = 6, dpi = 300)
+```
+
+
+NO BARS, SAMPLES WITH ZERO INCLUDED. UNFORTUNATELY, CAN'T PLOT MEANS FOR SOME STUPID REASON.
+
+```{r}
+## ============================================================
+## DVG TYPE COUNTS FOR PLOT
+## ============================================================
+
+# Types to keep (omit Insertions)
+plot_types <- c("Deletion_forward", "Deletion_reverse", "3cb/sb")
+
+# Custom labels for the x axis
+custom_labels <- c(
+  "Deletion_forward"  = "Forward deletions",
+  "Deletion_reverse"  = "Reverse deletions",
+  "3cb/sb"            = "3' copy-back/snap-back"
+)
+
+# All samples that passed coverage filtering and remain in `dvg`
+# (this is your "good samples" universe)
+all_samples <- dvg %>%
+  distinct(SampleID, Host, HostStrain, Sex) %>%
+  filter(!is.na(Host), !is.na(HostStrain), !is.na(Sex))
+
+# Restrict dvg_type_counts to the types we actually want to plot
+dvg_type_counts_plot <- dvg_type_counts %>%
+  filter(DVG_type %in% plot_types)
+
+# Expand to all SampleID × DVG_type combinations in the good-sample universe,
+# then left-join counts and fill missing with zero.
+dvg_plot <- all_samples %>%
+  tidyr::crossing(DVG_type = plot_types) %>%
+  left_join(dvg_type_counts_plot,
+            by = c("SampleID", "Host", "HostStrain", "Sex", "DVG_type")) %>%
+  mutate(
+    n = replace_na(n, 0),
+    # factor with desired order and labels
+    DVG_type = factor(DVG_type,
+                      levels = plot_types,
+                      labels = custom_labels),
+    # value used for plotting on log scale
+    n_plot = ifelse(n == 0, 0.3, n)
+  )
+
+bar_rect <- dvg_plot %>%
+  group_by(DVG_type, Host) %>%
+  summarise(
+    ymin = 0.3,             # <-- your chosen zero
+    ymax = mean(n_plot),    # <-- bar height
+    .groups = "drop"
+  ) %>%
+  mutate(
+    x = as.numeric(DVG_type),
+    xmin = x + c(-0.3, -0.1, 0.1, 0.3)[as.numeric(Host)],  # 4 hosts spaced
+    xmax = x + c(-0.1, 0.1, 0.3, 0.5)[as.numeric(Host)]
+  )
+
+
+## ============================================================
+## PLOT
+## ============================================================
+
+host_colors <- c(
+  "BALBF" = "#F94040",
+  "BALBM" = "#0000FF",
+  "BL6F"  = "#C5944E",
+  "BL6M"  = "#0F99B2"
+)
+
+dodge <- position_dodge(width = 0.7)
+
+p <- ggplot(dvg_plot, aes(x = DVG_type, y = n_plot, fill = Host)) +
+
+  # Mean bars (semi transparent)
+geom_rect(
+  data = bar_rect,
+  aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+  fill = "black",
+  alpha = 0.80,
+  inherit.aes = FALSE
+) +
+
+  # SE whiskers
+  geom_errorbar(
+    stat      = "summary",
+    fun.data  = mean_se,
+    position  = dodge,
+    width     = 0.4,
+    color     = "black",
+    linewidth = 0.5
+  ) +
+
+  # Individual sample points
+  geom_jitter(
+    aes(color = Host),
+    position = position_jitterdodge(
+      jitter.width = 0.2,
+      dodge.width  = 0.7
+    ),
+    size  = 2.2,
+    alpha = 0.9
+  ) +
+
+  scale_fill_manual(values = host_colors) +
+  scale_color_manual(values = host_colors) +
+
+  # Log scale with 0.3 shown as "0"
+  scale_y_log10(
+    breaks = c(0.3, 1, 3, 10, 30, 100, 300),
+    labels = c("0",  "1", "3", "10", "30", "100", "300"),
+      ) +
+
+  labs(x = "", y = "Unique DVGs (log scale)") +
+
+  theme_minimal(base_size = 16) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line        = element_line(color = "black"),
+    axis.ticks       = element_line(color = "black"),
+    legend.position  = "none"
+  )
+
+p
+
+ggsave("Images/DVG_Types/DVGtype_grouped_meanSE_transparentBars.png",
+       p, width = 10, height = 6, dpi = 300)
+
+```
+
+
+

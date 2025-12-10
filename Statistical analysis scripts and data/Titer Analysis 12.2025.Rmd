@@ -1,0 +1,182 @@
+---
+title: "Titers KW and Dunn's"
+author: "RC"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(dplyr)
+library(dunn.test)
+library(Hmisc)
+```
+
+Subset data
+```{r}
+#titers <- read.csv("GroupedtiterR10.csv", sep=',', header=T)
+
+titers <- read.csv("Titers-lineage-only.csv", sep=',', header=T)
+
+r10titers <- subset(titers, Type!= "HK68")
+```
+
+
+```{r}
+# Prepare the output file for capturing the analysis results
+sink("TCID50 Pairwise by host and by genotype.txt")
+
+  # Kruskal-Wallis test
+  cat("Kruskal-Wallis Test:\n")
+  kruskal_result <- kruskal.test(TCID50 ~ Host, data = r10titers)
+  print(kruskal_result)
+  
+  # Check if Kruskal-Wallis test is significant before proceeding to Dunn's test
+  if (kruskal_result$p.value < 0.05) {
+    cat("Since p-value is less than 0.05, proceeding with Dunn's test for pairwise comparisons.\n")
+    
+    # Dunn's test for pairwise comparisons
+    dunn_result <- dunn.test(r10titers$TCID50, r10titers$Host, method="bonferroni")
+    print(dunn_result)
+  } else {
+    cat("Kruskal-Wallis test p-value is not less than 0.05. No significant difference detected among groups.\n")
+  }
+  
+  cat("\n\n") # Add extra line for readability
+  
+  cat("Mann–Whitney U Test BY HOST GENOTYPE:\n")
+
+# Extract the two groups
+group1 <- r10titers %>% filter(HostStrain == "BALB/C") %>% pull(TCID50)
+group2 <- r10titers %>% filter(HostStrain == "C57BL/6") %>% pull(TCID50)
+
+# Remove NAs
+group1 <- group1[!is.na(group1)]
+group2 <- group2[!is.na(group2)]
+
+mw_result <- wilcox.test(group1, group2, alternative = "two.sided", exact = FALSE)
+
+print(mw_result)
+
+cat("\n")
+
+
+# Redirect output back to the console
+sink()
+
+```
+
+```{r}
+# Prepare the output file for capturing the analysis results
+sink("COPYN_kruskal_dunn_results.txt")
+
+  # Kruskal-Wallis test
+  cat("Kruskal-Wallis Test:\n")
+  kruskal_result <- kruskal.test(Copy.Number ~ Host, data = r10titers)
+  print(kruskal_result)
+  
+  # Check if Kruskal-Wallis test is significant before proceeding to Dunn's test
+  if (kruskal_result$p.value < 0.05) {
+    cat("Since p-value is less than 0.05, proceeding with Dunn's test for pairwise comparisons.\n")
+    
+    # Dunn's test for pairwise comparisons
+    dunn_result <- dunn.test(r10titers$Copy.Number, r10titers$Host, method="bonferroni")
+    print(dunn_result)
+  } else {
+    cat("Kruskal-Wallis test p-value is not less than 0.05. No significant difference detected among groups.\n")
+  }
+  
+  cat("\n") # Add extra line for readability
+
+# Redirect output back to the console
+sink()
+
+```
+
+
+```{r}
+# Prepare the output file for capturing the analysis results
+sink("Specific infectivity_pairwise and by genotype_results.txt")
+
+  # Kruskal-Wallis test
+  cat("Kruskal-Wallis Test:\n")
+  kruskal_result <- kruskal.test(Specific.infectivity ~ Host, data = r10titers)
+  print(kruskal_result)
+  
+  # Check if Kruskal-Wallis test is significant before proceeding to Dunn's test
+  if (kruskal_result$p.value < 0.05) {
+    cat("Since p-value is less than 0.05, proceeding with Dunn's test for pairwise comparisons.\n")
+    
+    # Dunn's test for pairwise comparisons
+    dunn_result <- dunn.test(r10titers$Specific.infectivity, r10titers$Host, method="bonferroni")
+    print(dunn_result)
+  } else {
+    cat("Kruskal-Wallis test p-value is not less than 0.05. No significant difference detected among groups.\n")
+  }
+  
+  cat("\n\n") # Add extra line for readability
+  
+    cat("Mann–Whitney U Test BY HOST GENOTYPE:\n")
+
+# Extract the two groups
+group1 <- r10titers %>% filter(HostStrain == "BALB/C") %>% pull(Specific.infectivity)
+group2 <- r10titers %>% filter(HostStrain == "C57BL/6") %>% pull(Specific.infectivity)
+
+# Remove NAs
+group1 <- group1[!is.na(group1)]
+group2 <- group2[!is.na(group2)]
+
+mw_result <- wilcox.test(group1, group2, alternative = "two.sided", exact = FALSE)
+
+print(mw_result)
+
+cat("\n")
+
+
+# Redirect output back to the console
+sink()
+
+```
+
+```{r}
+
+sink("TCID50_Ancestral_vs_evolved_pairwise_MWU_results.txt")
+
+cat("Pairwise Mann–Whitney tests: HK68 vs Adapted (R10) within each host\n\n")
+
+hosts <- unique(titers$Host)
+
+for (h in hosts) {
+  cat("Host:", h, "\n")
+  
+  hk <- titers %>% 
+    filter(Host == h, Treatment == "HK68") %>% 
+    pull(TCID50)
+  
+  r10 <- r10titers %>% 
+    filter(Host == h, Treatment != "HK68") %>% 
+    pull(TCID50)
+  
+  # Remove NA values
+  hk <- hk[!is.na(hk)]
+  r10 <- r10[!is.na(r10)]
+  
+  # Mann–Whitney U test
+  if (length(hk) > 0 & length(r10) > 0) {
+    test <- wilcox.test(r10, hk, alternative = "two.sided", exact = FALSE)
+    
+    cat("  n_HK68 =", length(hk), " n_R10 =", length(r10), "\n")
+    cat("  W =", test$statistic, "  p =", test$p.value, "\n\n")
+  } else {
+    cat("  Not enough data for this host.\n\n")
+  }
+}
+
+sink()
+
+```
+
