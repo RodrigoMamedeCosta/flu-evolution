@@ -3,7 +3,7 @@
 ## **Overview**
 This repository contains **R scripts and datasets** required for reproducing the rolling sphere analysis and most statistical analyses from:
 
-> **Costa RM, Acosta-Alvarez L, Curtis K, Zarbock K, Kelleher J, et al.**  https://github.com/RodrigoMamedeCosta/flu-evolution/blob/main/README.md
+> **Costa RM, Acosta-Alvarez L, Curtis K, Zarbock K, Kelleher J, et al.** 
 > *Host genotype and sex shape influenza evolution and defective viral genomes* (2025).  
 
 ## **Contents**
