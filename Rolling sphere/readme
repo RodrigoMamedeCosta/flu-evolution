@@ -1,0 +1,2 @@
+The rolling sphere is plug and play. Get the distance matrices, get the table with ancestral and derived reads and run everything. Should run without problem.
+If running new data, just ensure that input data is formatted similarly, or update script accordingly.
