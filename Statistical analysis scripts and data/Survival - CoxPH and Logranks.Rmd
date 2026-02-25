@@ -1,7 +1,7 @@
 kni---
-title: "Survival Pooling"
+title: "Survival tests for host differences"
 author: "RC"
-date: "2023-12-20"
+date: "2025-12-20"
 output: html_document
 ---
 Initially did only Cox Proportional hazards to account for multiple variables including strain. Since we are doing things a bit differently now, doing logrank as well. need to decide what to do.
