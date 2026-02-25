@@ -1,0 +1,160 @@
+---
+title: "Pooling Survival"
+author: "RC"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lme4)
+library(lmerTest)
+library(survival)
+library(tidyverse)
+```
+
+```{r}
+pvalue <- function(x, ...) UseMethod("pvalue")
+pvalue.survdiff <- function (x, ...) {
+  if (length(x$n) == 1) {
+    df <- 1
+    pval <- pchisq(x$chisq, 1, lower.tail = FALSE)
+  } else {
+    if (is.matrix(x$obs)) {
+      otmp <- rowSums(x$obs)
+      etmp <- rowSums(x$exp)
+    } else {
+      otmp <- x$obs
+      etmp <- x$exp
+    }
+    df <- sum(etmp > 0) - 1
+    pval <- pchisq(x$chisq, df, lower.tail = FALSE)
+  }
+  list(chisq = x$chisq, p.value = pval, df = df)
+  cat("Chi-squared:", x$chisq, "\nP-value:", pval, "\nDegrees of Freedom:", df, "\n")
+}
+
+```
+
+Load data
+```{r}
+survdata<- read.csv("Groupedvirulence.master.csv", sep=',', header=T)
+```
+
+Make dataframes
+```{r}
+#All the data, including unfamiliar
+survdata2 <- subset(survdata, Treatment!="1XP" & Treatment !="STOCK") 
+#Only familiar infections
+survdatafam <- subset(survdata, Treatment!="1XP" & Treatment!="STOCK" & Familiarity=="FAM")
+
+#Set base levels
+survdatafam$Host <- relevel(factor(survdatafam$Host), ref = "BALBF")
+survdatafam$Treatment <- relevel(factor(survdatafam$Treatment), ref = "1X")
+
+```
+
+___POOLING DIFFERENCES___
+Cox proportional hazards for comparisons between pooling treatments, including host as a fixed effect (but not looking at interactions):
+
+```{r}
+# Fit a CoxPH model for Treatment only
+survdatafam$Host <- relevel(factor(survdatafam$Host), ref = "BALBF")
+survdatafam$Treatment <- relevel(factor(survdatafam$Treatment), ref = "1X")
+cox_model <- coxph(Surv(TTD, Event) ~ Treatment + Host, data = survdatafam)
+
+# Print the summary of the model to see the results
+summary(cox_model)
+
+# Save to txt (no csv possible)
+sink("CoxPH-Treatment.txt")
+print(cox_model)
+sink()
+
+```
+
+
+
+
+___1X vs 1XP___
+```{r}
+survdatafem <- subset(survdata, Treatment=="1X" | Treatment=="1XP") #Only 1X and 1XP
+survdatafem <- subset(survdatafem, Sex=="F")
+survdatafemfam <- subset(survdatafem, Familiarity == "FAM")
+```
+
+Does 1XP increase mortality in general?
+```{r}
+# Convert Test to a factor
+survdatafem$Test <- factor(survdatafem$Test)
+
+#Relevel 
+survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
+
+#Run analyses
+survdatafem$TTD
+table(survdatafem$Event,survdatafem$TTD)
+Surv(survdatafem$TTD,survdatafem$Event)
+
+
+
+cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Treatment), data=survdatafem)
+summary(cox)
+
+#Save
+sink("coxph-1XP-female-only.txt")
+print(cox)
+sink()
+```
+Yes
+
+
+Does 1XP increase mortality in familiar more than unfamiliar?
+```{r}
+# Convert Test to a factor
+survdatafem$Test <- factor(survdatafem$Test)
+
+#Relevel 
+survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
+
+#Run analyses
+survdatafem$TTD
+table(survdatafem$Event,survdatafem$TTD)
+Surv(survdatafem$TTD,survdatafem$Event)
+
+
+
+cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Treatment) * factor(Familiarity), data=survdatafem)
+summary(cox)
+
+sink("coxph-1XP-treatment-familiarity.txt")
+print(cox)
+sink()
+```
+No, but that's because the increase in mortality makes them equal. So it actually negates the tradeoff of the bl6 into balb.
+
+Complete test: separated by host and strain.
+```{r}
+# Convert Test to a factor
+survdatafem$Test <- factor(survdatafem$Test)
+survdatafem$Treatment <- factor(survdatafem$Treatment)
+#Relevel 
+survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
+survdatafem$Treatment <- relevel(survdatafem$Treatment, ref="1X")
+
+#Run analyses
+survdatafem$TTD
+table(survdatafem$Event,survdatafem$TTD)
+Surv(survdatafem$TTD,survdatafem$Event)
+
+
+
+cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Test) * factor(Treatment), data=survdatafem)
+summary(cox)
+
+sink("coxph-1XP-test.txt")
+print(cox)
+sink()
+```
+
+This shows that 1XP causes treatments to be similarly high virulence. But not as good test as above.
