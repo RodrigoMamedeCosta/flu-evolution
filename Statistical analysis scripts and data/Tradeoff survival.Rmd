@@ -44,10 +44,11 @@ Load data
 survdata<- read.csv("Groupedvirulence.master.csv", sep=',', header=T)
 ```
 
-Remove stock virus 
+Remove stock virus and 2X since BL6 UNF doesn't have it.
 ```{r Remove stock virus}
-survdata <- subset(survdata, Treatment!="STOCK" )
+survdata <- subset(survdata, Treatment !="STOCK" & Treatment != "1XP" & Treatment != "2X" & Sex =="F")
 survdata$Host <- relevel(factor(survdata$Host), ref = "BALBF")
+
 ```
 
 1. Are there tradeoffs overall?
@@ -59,7 +60,7 @@ How does the virulence  each host-adapted virus look like in familiar and unfami
     Note: BL6 UNF has no mortality, so we have to assume significance and exclude from models.
  
 ```{r Are there tradeoffs overall?}
-tradeoffs <- subset(survdata, Treatment != "1XP" & Sex =="F")
+tradeoffs <- survdata
 
 # Create a new column with Host and familiarity
 tradeoffs$HostFam <- paste0(tradeoffs$Host,"_",tradeoffs$Familiarity)
@@ -166,32 +167,36 @@ for (comparison_name in names(comparisons)) {
 sink()
 
 ```
+
 ##############################################
              BALBF_FAM vs BALBF_UNF 
 ##############################################
-
 Call:
 survdiff(formula = surv_obj ~ HostFam, data = tradeoffs_subset)
 
                    N Observed Expected (O-E)^2/E (O-E)^2/V
-HostFam=BALBF_FAM 22       10     12.6     0.529      1.39
-HostFam=BALBF_UNF 22       13     10.4     0.639      1.39
+HostFam=BALBF_FAM 14        8    10.14     0.452      1.35
+HostFam=BALBF_UNF 14       10     7.86     0.583      1.35
 
- Chisq= 1.4  on 1 degrees of freedom, p= 0.2 
-  
+ Chisq= 1.3  on 1 degrees of freedom, p= 0.2 
+Chi-squared: 1.348554 
+P-value: 0.2455 
+Degrees of Freedom: 1 
+
 ##############################################
              BL6F_FAM vs BL6F_UNF 
 ##############################################
-
 Call:
 survdiff(formula = surv_obj ~ HostFam, data = tradeoffs_subset)
 
                   N Observed Expected (O-E)^2/E (O-E)^2/V
-HostFam=BL6F_FAM 22        6     3.54      1.72      4.36
-HostFam=BL6F_UNF 14        0     2.46      2.46      4.36
+HostFam=BL6F_FAM 14        3     1.44      1.68      3.24
+HostFam=BL6F_UNF 14        0     1.56      1.56      3.24
 
- Chisq= 4.4  on 1 degrees of freedom, p= 0.04 
-
+ Chisq= 3.2  on 1 degrees of freedom, p= 0.07 
+Chi-squared: 3.240122 
+P-value: 0.07186 
+Degrees of Freedom: 1 
 
 
 But does familiarity matter overall?
@@ -246,7 +251,7 @@ summary(model.overallvir)
 # Save
 sink()
 ```
-Very different mortality.
+Very different m  ortality.
 
 
 3. How does pooling affect virulence: 1X, 2X, 4X (No 1XP here) in unfamiliar infections?
@@ -351,7 +356,7 @@ p = 0.02. Interesting. Not the best analysis though.
 6. Do BL6 die more than BALB overall, regardless of virus?
 ```{r  Do BL6 die more than BALB overall, regardless of virus?}
 
-hostmort <- subset(survdata, Treatment != "1XP" & Sex =="F")
+hostmort <- subset(survdata, Treatment != "1XP" &  Treatment != "1XP" & Sex =="F")
 
 
 hostmort$HostStrain <- relevel(factor(hostmort$HostStrain), ref = "BALB/C")
