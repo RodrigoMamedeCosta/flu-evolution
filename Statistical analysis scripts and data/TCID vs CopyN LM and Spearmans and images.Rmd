@@ -96,6 +96,470 @@ sink()  # End sink
 cat(paste("Results saved to", output_file, "\n"))
 
 ```
+95% confidence intervals?
+
+```{r}
+library(dplyr)
+library(boot)
+
+# Ensure Host is a stable label, not integer codes
+data$Host <- as.character(data$Host)
+
+# Output file
+output_file <- "TCID50_vs_CopyNumber_spearman_debug.txt"
+
+# Bootstrap statistic with degeneracy guard
+spearman_fn <- function(df, indices) {
+  d <- df[indices, , drop = FALSE]
+  if (sd(d$log.TCID50, na.rm = TRUE) == 0 || sd(d$log.Copy.Number, na.rm = TRUE) == 0) return(NA_real_)
+  suppressWarnings(cor(d$log.TCID50, d$log.Copy.Number, method = "spearman", use = "complete.obs"))
+}
+
+# Per host analysis returning both results and debug
+per_host <- function(df_host, R = 5000) {
+
+  # Basic diagnostics
+  n_total <- nrow(df_host)
+  n_complete <- sum(complete.cases(df_host[, c("log.TCID50", "log.Copy.Number")]))
+  n_missing <- n_total - n_complete
+
+  x <- df_host$log.TCID50
+  y <- df_host$log.Copy.Number
+
+  uniq_x <- length(unique(x[!is.na(x)]))
+  uniq_y <- length(unique(y[!is.na(y)]))
+  ties_x <- n_complete - length(unique(x[complete.cases(x, y)]))
+  ties_y <- n_complete - length(unique(y[complete.cases(x, y)]))
+
+  # Point estimate + p value (approx because ties possible)
+  rho <- suppressWarnings(cor(x, y, method = "spearman", use = "complete.obs"))
+  p_val <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE)$p.value)
+
+  # Bootstrap
+  b <- boot(df_host, spearman_fn, R = R)
+  reps_all <- as.numeric(b$t)
+  n_na <- sum(is.na(reps_all))
+  reps <- reps_all[!is.na(reps_all)]
+  n_valid <- length(reps)
+  pct_valid <- 100 * n_valid / R
+
+  # CI from valid reps
+  ci <- c(NA_real_, NA_real_)
+  if (n_valid >= 100) {
+    ci <- as.numeric(quantile(reps, probs = c(0.025, 0.975), names = FALSE))
+  }
+
+  tibble(
+    n_total = n_total,
+    n_complete = n_complete,
+    n_missing = n_missing,
+    uniq_log_TCID50 = uniq_x,
+    uniq_log_CopyNumber = uniq_y,
+    ties_log_TCID50 = ties_x,
+    ties_log_CopyNumber = ties_y,
+    spearman_rho = rho,
+    p_value = p_val,
+    CI_lower = ci[1],
+    CI_upper = ci[2],
+    boot_R = R,
+    boot_valid = n_valid,
+    boot_na = n_na,
+    boot_valid_pct = pct_valid,
+    boot_rep_min = ifelse(n_valid > 0, min(reps), NA_real_),
+    boot_rep_max = ifelse(n_valid > 0, max(reps), NA_real_)
+  )
+}
+
+# Run per host
+results <- data %>%
+  group_by(Host) %>%
+  group_modify(~ per_host(.x, R = 5000)) %>%
+  ungroup()
+
+# Write a human readable debug report
+sink(output_file)
+
+cat("Spearman correlation debug report\n")
+cat("Variables: log.TCID50 vs log.Copy.Number\n")
+cat("CI method: bootstrap percentile from non-degenerate resamples\n")
+cat("P values: cor.test(method='spearman', exact=FALSE)\n")
+cat("------------------------------------------------------------\n\n")
+
+for (i in seq_len(nrow(results))) {
+
+  cat("Host: ", results$Host[i], "\n", sep = "")
+  cat("  N total: ", results$n_total[i],
+      " | N complete: ", results$n_complete[i],
+      " | N missing: ", results$n_missing[i], "\n", sep = "")
+
+  cat("  Unique values: log.TCID50 = ", results$uniq_log_TCID50[i],
+      " | log.Copy.Number = ", results$uniq_log_CopyNumber[i], "\n", sep = "")
+
+  cat("  Tie counts (approx, among complete pairs): log.TCID50 = ", results$ties_log_TCID50[i],
+      " | log.Copy.Number = ", results$ties_log_CopyNumber[i], "\n", sep = "")
+
+  cat("  Spearman rho: ", sprintf("%.3f", results$spearman_rho[i]),
+      " | p: ", format.pval(results$p_value[i], digits = 3, eps = 1e-16), "\n", sep = "")
+
+  cat("  95% CI: [", sprintf("%.3f", results$CI_lower[i]), ", ",
+      sprintf("%.3f", results$CI_upper[i]), "]\n", sep = "")
+
+  cat("  Bootstrap: R = ", results$boot_R[i],
+      " | valid = ", results$boot_valid[i],
+      " (", sprintf("%.1f", results$boot_valid_pct[i]), "%)",
+      " | NA = ", results$boot_na[i], "\n", sep = "")
+
+  cat("  Bootstrap reps range: [", sprintf("%.3f", results$boot_rep_min[i]),
+      ", ", sprintf("%.3f", results$boot_rep_max[i]), "]\n", sep = "")
+
+  if (results$boot_valid[i] < 1000) {
+    cat("  WARNING: Many degenerate bootstrap samples. CI may be unstable.\n")
+  }
+
+  cat("\n")
+}
+
+sink()
+
+cat("Debug report saved to ", output_file, "\n", sep = "")
+```
+
+
+
+Plot
+
+```{r}
+p <- ggplot(data, aes(x = Copy.Number, y = TCID50, color = Host, shape = Host, linetype = Host)) +
+  geom_point(size = 4.5, stroke = 1.2) +
+  geom_smooth(data = subset(data, Host %in% c("BALBF", "BALBM")), method = "rlm", se = FALSE, size = 0.7) +  # Thicker dashed lines for BALBF & BALBM
+  geom_smooth(data = subset(data, Host %in% c("BL6F", "BL6M")), method = "rlm", se = FALSE, size = 0.5) +  # Thinner solid lines for BL6F & BL6M
+  scale_x_log10(
+    limits = c(9e5, 1.2e9),
+    breaks = c(1e6, 1e7, 1e8, 1e9),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))  # Use proper scientific formatting
+  ) +
+  scale_y_log10(
+    limits = c(500, 1e7),
+    breaks = c(1e3, 1e4, 1e5, 1e6, 1e7),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))  # Use proper scientific formatting
+  ) +
+  geom_hline(yintercept = 1e3, linetype = "dotted", size = 1) +
+  labs(x = "Copy number", y = expression(bold(TCID[50]))) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 24, face = "bold", color = "black", 
+                                margin = margin(t = 15)),
+    axis.title.y = element_text(size = 24, face = "bold", color = "black", 
+                                margin = margin(r = 15)),
+    axis.text = element_text(size = 20, face = "bold", color = "black"),
+    axis.line = element_line(size = 1.3, color = "black"),
+    axis.ticks = element_line(size = 1.2),
+    axis.ticks.length = unit(8, "pt"),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 18),
+    legend.title = element_blank()
+  ) +
+  scale_color_manual(values = c("BALBF" = "#f94040", "BALBM" = "#0000FF", "BL6F" = "#C5944E", "BL6M" = "#0F99B2")) +
+  scale_shape_manual(values = c("BALBF" = 1, "BALBM" = 22, "BL6F" = 16, "BL6M" = 15)) +
+  scale_linetype_manual(values = c("BALBF" = "dashed", "BALBM" = "dashed", "BL6F" = "solid", "BL6M" = "solid")) +
+  guides(color = guide_legend(override.aes = list(linetype = "blank")),
+         shape = guide_legend(override.aes = list(linetype = "blank")))
+
+print(p)
+
+svg("TCID50vsCopyNumber.svg", width = 10, height = 6)
+print(p) # Replace `p` with your ggplot object
+dev.off()
+
+ggsave(filename = "TCID50vsCopyNumber2.png", bg = 'white', width = 5, height = 5, device='png', dpi=300)
+
+```
+Separation at the limit of detection
+
+```{r}
+# Define detection limit
+lod <- 1e3
+
+# Create adjusted y for plotting (adds a small offset to create visible separation)
+data$TCID50_adj <- ifelse(data$TCID50 < lod, lod * 0.9, data$TCID50)
+
+# Make plot
+p <- ggplot(data, aes(x = Copy.Number, y = TCID50_adj, color = Host, shape = Host, linetype = Host)) +
+  geom_point(size = 4.5, stroke = 1.2) +
+  geom_smooth(data = subset(data, Host %in% c("BALBF", "BALBM")), method = "rlm", se = FALSE, size = 0.7) +
+  geom_smooth(data = subset(data, Host %in% c("BL6F", "BL6M")), method = "rlm", se = FALSE, size = 0.5) +
+  scale_x_log10(
+    limits = c(9e5, 1.2e9),
+    breaks = c(1e6, 1e7, 1e8, 1e9),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))
+  ) +
+  scale_y_log10(
+    limits = c(500, 1e7),
+    breaks = c(1e3, 1e4, 1e5, 1e6, 1e7),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))
+  ) +
+  geom_hline(yintercept = lod, linetype = "dotted", size = 1) +
+  # Add a white rectangle to create a visible break at LOD
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = lod * 0.95, ymax = lod * 1.05, fill = "white", color = NA) +
+  labs(x = "Copy number", y = expression(bold(TCID[50]))) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 24, face = "bold", color = "black", margin = margin(t = 15)),
+    axis.title.y = element_text(size = 24, face = "bold", color = "black", margin = margin(r = 15)),
+    axis.text = element_text(size = 20, face = "bold", color = "black"),
+    axis.line = element_line(size = 1.3, color = "black"),
+    axis.ticks = element_line(size = 1.2),
+    axis.ticks.length = unit(8, "pt"),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 18),
+    legend.title = element_blank()
+  ) +
+  scale_color_manual(values = c("BALBF" = "#f94040", "BALBM" = "#0000FF", "BL6F" = "#C5944E", "BL6M" = "#0F99B2")) +
+  scale_shape_manual(values = c("BALBF" = 1, "BALBM" = 22, "BL6F" = 16, "BL6M" = 15)) +
+  scale_linetype_manual(values = c("BALBF" = "dashed", "BALBM" = "dashed", "BL6F" = "solid", "BL6M" = "solid")) +
+  guides(color = guide_legend(override.aes = list(linetype = "blank")),
+         shape = guide_legend(override.aes = list(linetype = "blank")))
+
+
+print(p)
+
+svg("TCID50vsCopyNumber-separated.svg", width = 10, height = 6)
+print(p) # Replace `p` with your ggplot object
+dev.off()
+
+ggsave(filename = "TCID50vsCopyNumber-separated-2.svg", bg = 'white', width = 8, height = 5, device='svg', dpi=300)
+
+```
+
+
+To convert markdown to simple r code: knitr::purl("TCID vs CopyN LM and Spearmans and images.Rmd")---
+title: "Titers correlationss"
+author: "RC"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load necessary libraries
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(scales)
+library(MASS)
+```
+
+Subset data
+```{r}
+data <- read.csv("GroupedtiterR10.csv", sep=',', header=T)
+
+data <- data %>%
+  filter(!is.na(Copy.Number)) %>%
+   filter(!ID %in% c(9770, 10318))
+
+# Ensure TCID50 and Copy Number are numeric
+data <- data %>%
+  mutate(TCID50 = as.numeric(TCID50),
+         Copy.Number = as.numeric(`Copy.Number`),
+         Host = as.factor(Host))
+
+data <- data %>%
+  mutate(log.TCID50 = log10(TCID50 + 1)) %>%
+  mutate(log.Copy.Number = log10(Copy.Number))
+```
+
+Try the simple model, the models with interactions and the LMM.
+
+Models
+```{r}
+
+# Fit the linear models
+lm_model <- lm(log.TCID50 ~ log.Copy.Number + Host, data = data)
+
+# Summary of the model
+summary(lm_model)
+
+# Combined model with interaction
+lm_2 <- lm(log.TCID50 ~ log.Copy.Number * Host, data = data)
+summary(lm_2)
+
+# Fit the linear mixed-effects model, Host as a random effect
+model_lmer <- lmer(log.TCID50 ~ log.Copy.Number + (log.Copy.Number | Host), data = data)
+
+# Summary of the model
+summary(model_lmer)
+
+# Just in case, also testing by genotype
+lm_model <- lm(log.TCID50 ~ log.Copy.Number * HostStrain, data = data)
+
+# Summary of the model
+summary(lm_model)
+
+```
+
+The slopes are significantly different using an interaction term in the multiple regression. So we'll just keep it simple and do separate spearman's for each strain.
+
+```{r}
+# Calculate Spearman's correlation for each Host
+spearman_results <- data %>%
+  group_by(Host) %>%
+  summarise(
+    spearman_rho = cor(log.TCID50, log.Copy.Number, method = "spearman"),
+    p_value = suppressWarnings(cor.test(log.TCID50, log.Copy.Number, method = "spearman")$p.value) # Suppress warnings
+  )
+
+# Specify the output file
+output_file <- "TCID50_vs_CopyNumber_spearman_results.txt"
+
+# Sink the results to a text file
+sink(output_file)
+cat("Spearman's Correlation Results by Host\n")
+cat("--------------------------------------\n")
+for (i in 1:nrow(spearman_results)) {
+  cat(paste0(
+    "Host: ", spearman_results$Host[i], 
+    ", Spearman's rho: ", round(spearman_results$spearman_rho[i], 3), 
+    ", p-value: ", format.pval(spearman_results$p_value[i], digits = 3), "\n"
+  ))
+}
+sink()  # End sink
+
+# Confirmation message
+cat(paste("Results saved to", output_file, "\n"))
+
+```
+95% confidence intervals?
+
+```{r}
+library(dplyr)
+library(boot)
+
+# Ensure Host is a stable label, not integer codes
+data$Host <- as.character(data$Host)
+
+# Output file
+output_file <- "TCID50_vs_CopyNumber_spearman_debug.txt"
+
+# Bootstrap statistic with degeneracy guard
+spearman_fn <- function(df, indices) {
+  d <- df[indices, , drop = FALSE]
+  if (sd(d$log.TCID50, na.rm = TRUE) == 0 || sd(d$log.Copy.Number, na.rm = TRUE) == 0) return(NA_real_)
+  suppressWarnings(cor(d$log.TCID50, d$log.Copy.Number, method = "spearman", use = "complete.obs"))
+}
+
+# Per host analysis returning both results and debug
+per_host <- function(df_host, R = 5000) {
+
+  # Basic diagnostics
+  n_total <- nrow(df_host)
+  n_complete <- sum(complete.cases(df_host[, c("log.TCID50", "log.Copy.Number")]))
+  n_missing <- n_total - n_complete
+
+  x <- df_host$log.TCID50
+  y <- df_host$log.Copy.Number
+
+  uniq_x <- length(unique(x[!is.na(x)]))
+  uniq_y <- length(unique(y[!is.na(y)]))
+  ties_x <- n_complete - length(unique(x[complete.cases(x, y)]))
+  ties_y <- n_complete - length(unique(y[complete.cases(x, y)]))
+
+  # Point estimate + p value (approx because ties possible)
+  rho <- suppressWarnings(cor(x, y, method = "spearman", use = "complete.obs"))
+  p_val <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE)$p.value)
+
+  # Bootstrap
+  b <- boot(df_host, spearman_fn, R = R)
+  reps_all <- as.numeric(b$t)
+  n_na <- sum(is.na(reps_all))
+  reps <- reps_all[!is.na(reps_all)]
+  n_valid <- length(reps)
+  pct_valid <- 100 * n_valid / R
+
+  # CI from valid reps
+  ci <- c(NA_real_, NA_real_)
+  if (n_valid >= 100) {
+    ci <- as.numeric(quantile(reps, probs = c(0.025, 0.975), names = FALSE))
+  }
+
+  tibble(
+    n_total = n_total,
+    n_complete = n_complete,
+    n_missing = n_missing,
+    uniq_log_TCID50 = uniq_x,
+    uniq_log_CopyNumber = uniq_y,
+    ties_log_TCID50 = ties_x,
+    ties_log_CopyNumber = ties_y,
+    spearman_rho = rho,
+    p_value = p_val,
+    CI_lower = ci[1],
+    CI_upper = ci[2],
+    boot_R = R,
+    boot_valid = n_valid,
+    boot_na = n_na,
+    boot_valid_pct = pct_valid,
+    boot_rep_min = ifelse(n_valid > 0, min(reps), NA_real_),
+    boot_rep_max = ifelse(n_valid > 0, max(reps), NA_real_)
+  )
+}
+
+# Run per host
+results <- data %>%
+  group_by(Host) %>%
+  group_modify(~ per_host(.x, R = 5000)) %>%
+  ungroup()
+
+# Write a human readable debug report
+sink(output_file)
+
+cat("Spearman correlation debug report\n")
+cat("Variables: log.TCID50 vs log.Copy.Number\n")
+cat("CI method: bootstrap percentile from non-degenerate resamples\n")
+cat("P values: cor.test(method='spearman', exact=FALSE)\n")
+cat("------------------------------------------------------------\n\n")
+
+for (i in seq_len(nrow(results))) {
+
+  cat("Host: ", results$Host[i], "\n", sep = "")
+  cat("  N total: ", results$n_total[i],
+      " | N complete: ", results$n_complete[i],
+      " | N missing: ", results$n_missing[i], "\n", sep = "")
+
+  cat("  Unique values: log.TCID50 = ", results$uniq_log_TCID50[i],
+      " | log.Copy.Number = ", results$uniq_log_CopyNumber[i], "\n", sep = "")
+
+  cat("  Tie counts (approx, among complete pairs): log.TCID50 = ", results$ties_log_TCID50[i],
+      " | log.Copy.Number = ", results$ties_log_CopyNumber[i], "\n", sep = "")
+
+  cat("  Spearman rho: ", sprintf("%.3f", results$spearman_rho[i]),
+      " | p: ", format.pval(results$p_value[i], digits = 3, eps = 1e-16), "\n", sep = "")
+
+  cat("  95% CI: [", sprintf("%.3f", results$CI_lower[i]), ", ",
+      sprintf("%.3f", results$CI_upper[i]), "]\n", sep = "")
+
+  cat("  Bootstrap: R = ", results$boot_R[i],
+      " | valid = ", results$boot_valid[i],
+      " (", sprintf("%.1f", results$boot_valid_pct[i]), "%)",
+      " | NA = ", results$boot_na[i], "\n", sep = "")
+
+  cat("  Bootstrap reps range: [", sprintf("%.3f", results$boot_rep_min[i]),
+      ", ", sprintf("%.3f", results$boot_rep_max[i]), "]\n", sep = "")
+
+  if (results$boot_valid[i] < 1000) {
+    cat("  WARNING: Many degenerate bootstrap samples. CI may be unstable.\n")
+  }
+
+  cat("\n")
+}
+
+sink()
+
+cat("Debug report saved to ", output_file, "\n", sep = "")
+```
+
 
 
 Plot
