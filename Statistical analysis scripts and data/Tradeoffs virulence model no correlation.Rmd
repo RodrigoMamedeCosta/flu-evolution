@@ -1,0 +1,394 @@
+---
+title: "Model Test"
+author: "RC"
+date: "2024-02-28"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, include = FALSE)
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(MuMIn)
+```
+
+Load data
+```{r}
+alldata <- read.csv("groupedvirulence7days.csv", sep=',', header=T)
+```
+
+
+WHAT ARE THE QUESTIONS?
+
+1. How does each virus do in familiar vs unfamiliar settings?
+  BALBF Fam vs BALBF unfam vs BL6F Fam vs BL6F Unfam. Agnostic to pooling treatment but without 1XP because otherwise I'm biasing, as the same lineages infect more than once.
+
+2. Is one virus overall more virulent than the other?
+  BALBF-adapted vs BL6-adapted, agnostic to treatment and host of infection.
+
+3. Is one host more susceptible overall than the other?
+
+4. How does treatment affect virulence in the context of familiar vs unfamiliar?
+If viral diversity matters when infecting a new host, is 1XP more virulent?
+5.  Test 1XP vs 1X and also 4X, agnostic to familiarity but also in the context of host.
+
+5. F-test for variance of balb infections vs bl6 infections? Maybe have to normalize for mean weight loss per day, then look at spread.
+
+##### BALB_FAM vs BALB_UNFAM vs BL6FAM vs BL6UNFAM
+
+```{r BALB_FAM vs BALB_UNFAM vs BL6FAM vs BL6UNFAM}
+# Remove data that is not relevant
+tradeoffs <- subset(alldata, Treatment != "STOCK" & Treatment != "1XP"  & Sex == "F")
+
+# Scale and center
+tradeoffs$Day <- scale(tradeoffs$Day, center = TRUE, scale = TRUE)
+
+# Create a new column with Host and familiarity
+tradeoffs$HostFam <- paste0(tradeoffs$Host,"_",tradeoffs$Familiarity)
+tradeoffs$HostFam <- as.factor(tradeoffs$HostFam)
+
+# Levels to iterate over
+host_fams <- c("BALBF_FAM", "BALBF_UNF", "BL6F_FAM", "BL6F_UNF")
+
+# Open the file for writing all summaries
+sink("LMM-Tradeoffs_summary.txt")
+
+# Iterate over each level
+for (level in host_fams) {
+  
+  # Relevel HostFam
+  tradeoffs$HostFam <- relevel(factor(tradeoffs$HostFam), ref = level)
+  
+  # Run model
+  model.tradeoffs <- lmer(Pct ~ Day * HostFam + (Day||Line/ID), data = tradeoffs, REML = TRUE)
+  
+  # Write the title indicating the level
+  cat("\n\n##############################################\n")
+  cat("            Leveled on", level, "\n")
+  cat("##############################################\n\n")
+  
+  # Output summaries to the file
+  print(summary(model.tradeoffs))
+}
+
+# Save and close the file
+sink()
+
+```
+
+Ok, so only significant difference is BALBF_UNF vs BL6F_FAM /BL6F_UNF.
+BALB FAM vs BL6 (fam or unfam) are marginally significant.
+
+That means that BL6 getting the balb virus lose the most weight per day, BL6-adapted virus causes less weight loss in both balb and bl6F. So the host of adaptation is more determinant for virulence than the host of infection.
+
+
+What if we combine the data to see overall virulence of BALBF vs BL6F across familiar and unfamiliar hosts?
+
+####BALB-adapted vs BL6-adapted
+
+```{r BALB-adapted vs BL6-adapted}
+#Remove data that is not relevant
+overallvir <- subset(alldata, Treatment !="STOCK" & Sex == "F" & Treatment !="1XP" )
+
+#Level of 1X and familiar
+
+overallvir$Host <- relevel(factor(overallvir$Host), ref = "BALBF")
+overallvir$Familiarity <- relevel(factor(overallvir$Familiarity), ref = "FAM")
+
+#Scale and center.
+overallvir$Day <- scale(overallvir$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.overallvir <- lmer(Pct ~ Day * Host + (Day||Line/ID), data = overallvir, REML = TRUE)
+
+summary(model.overallvir)
+
+# Open the file for writing
+sink("LMM-Overall_virulence_BALBF_vs_BL6F.txt")
+
+# Output summaries to the file
+summary(model.overallvir)
+# Save
+sink()
+
+```
+
+But this includes 2X, which is not present in BL6UNF, so let's just compare 1X+4X for fairness.
+
+
+##### 1) Tradeoffs NO 1XP, NO 2X
+
+```{r}
+# Remove data that is not relevant
+tradeoffs <- subset(alldata, Treatment != "STOCK" & Treatment != "2X" & Treatment != "1XP" & Sex == "F")
+
+# Scale and center
+tradeoffs$Day <- scale(tradeoffs$Day, center = TRUE, scale = TRUE)
+
+# Create a new column with Status and Host -> Type
+tradeoffs$HostFam <- paste0(tradeoffs$Host,"_",tradeoffs$Familiarity)
+tradeoffs$HostFam <- as.factor(tradeoffs$HostFam)
+
+# Levels to iterate over
+host_fams <- c("BALBF_FAM", "BALBF_UNF", "BL6F_FAM", "BL6F_UNF")
+
+# Open the file for writing all summaries
+sink("LMM-Tradeoffs_1X&4X_summary.txt")
+
+# Iterate over each level
+for (level in host_fams) {
+  
+  # Relevel HostFam
+  tradeoffs$HostFam <- relevel(factor(tradeoffs$HostFam), ref = level)
+  
+  # Run model
+  model.tradeoffs <- lmer(Pct ~ Day * HostFam + (Day||Line/ID), data = tradeoffs, REML = TRUE)
+  
+  # Write the title indicating the level
+  cat("\n\n##############################################\n")
+  cat("            Leveled on", level, "\n")
+  cat("##############################################\n\n")
+  
+  # Output summaries to the file
+  print(summary(model.tradeoffs))
+}
+
+# Save and close the file
+sink()
+```
+
+
+#### 2) BALB-adapted vs BL6-adapted NO 2X
+```{r}
+#Remove data that is not relevant
+overallvir <- subset(alldata, Treatment !="STOCK" & Treatment != "2X" & Treatment != "1XP" & Sex == "F")
+
+#Level of 1X and familiar
+
+overallvir$Host <- relevel(factor(overallvir$Host), ref = "BALBF")
+overallvir$Familiarity <- relevel(factor(overallvir$Familiarity), ref = "FAM")
+
+#Scale and center.
+overallvir$Day <- scale(overallvir$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.overallvir <- lmer(Pct ~ Day * Host + (Day||Line/ID), data = overallvir, REML = TRUE)
+
+summary(model.overallvir)
+
+# Open the file for writing
+sink("LMM-1X&4X_virulence_BALBF_vs_BL6F.txt")
+
+# Output summaries to the file
+summary(model.overallvir)
+# Save
+sink()
+
+```
+
+###### 3) Is one host more susceptible overall than the other? HostStrain BALB/c vs C57BL/6 (combined viruses in each host) NO!
+
+```{r HostStrain BALB/c vs C57BL/6 DELETE}
+#Remove data that is not relevant
+overallvir <- subset(alldata, Treatment !="STOCK" & Treatment != "2X" & Treatment != "1XP" & Sex == "F")
+
+#Scale and center.
+overallvir$Day <- scale(overallvir$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.overallsusc <- lmer(Pct ~ Day * HostStrain + (Day||Line/ID), data = overallvir, REML = TRUE)
+
+summary(model.overallsusc)
+
+# Open the file for writing
+sink("LMM-1X&4X_susceptibility_BALBC_vs_BL6.txt")
+
+# Output summaries to the file
+summary(model.overallsusc)
+# Save
+sink()
+
+```
+
+
+Perhaps a repetitive question but is one host strain more susceptible to the familiar virus? What about the unfamiliar virus?
+
+```{r STRAIN MORE SUSCEPTIBLE TO FAM - DELETE}
+#Remove data that is not relevant
+overallvir <- subset(alldata, Treatment !="STOCK" & Treatment != "2X" & Treatment != "1XP" & Sex == "F")
+
+#Scale and center.
+overallvir$Day <- scale(overallvir$Day, center = TRUE, scale = TRUE)
+
+#overallvir <- subset(overallvir, Familiarity == "FAM")
+overallvir <- subset(overallvir, Familiarity == "UNF")
+
+
+#Run model
+model.overallsusc <- lmer(Pct ~ Day * HostStrain + (Day||Line/ID), data = overallvir, REML = TRUE)
+
+summary(model.overallsusc)
+
+# Open the file for writing
+sink("LMM-1X&4X_susceptibility_BALBC_vs_BL6_Unfamiliar.txt")
+
+# Output summaries to the file
+summary(model.overallsusc)
+# Save
+sink()
+
+```
+
+Familiar virus, HostStrain BALB/c vs C57BL/6: t = 2.774  p = 0.024941
+Unfamiliar virus, HostStrain BALB/c vs C57BL/6: t = -1.495 p = 0.1763
+
+BALB/c mice get significantly sicker than BL6 with the familiar virus, No major difference between mouse strains when infected with unfamliar virus. This is a bit meaningless though.
+
+
+
+Aaaanyway, let's look at the effect of pooling treatment.
+
+###### 4) Treatment effect. 1X vs 4X
+
+```{r POOLING 1X vs 4X TESTS}
+#Remove data that is not relevant
+treattest <- subset(alldata, Treatment !="STOCK" & Treatment != "2X" & Sex == "F" & Treatment != "1XP")
+
+# Subset to specify comparisons
+
+ #treattest <- subset(treattest, Host == "BL6F")
+ #treattest <- subset(treattest, HostStrain == "C57BL/6")
+ treattest <- subset(treattest, Familiarity == "UNF")
+
+#Level on 1X
+
+treattest$Treatment <- relevel(factor(treattest$Treatment), ref = "1X")
+
+#Scale and center.
+treattest$Day <- scale(treattest$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.treat <- lmer(Pct ~ Day * Treatment + (Day||Line/ID), data = treattest, REML = TRUE)
+
+# Open the file for writing
+sink("LMM-Tradeoff-1X-vs-4X.txt")
+
+# Output summaries to the file
+summary(model.treat)
+# Save
+sink()
+
+```
+
+    1X vs 4X for:
+Overall: t = -0.813 p = 0.443 
+BALB adapted virus in fam and unfam: t = -0.906 p= 0.448   
+BL6 adapted virus in fam and unfam: t =-0.445 p = 0.697
+BALB/c mice infected with both viruses: t = -0.363 p = 0.727
+C57BL/6 mice infected with both viruses: t = -0.996 p = 0.357
+Familiar: t = -0.904 p = 0.396    
+Unfamiliar: t = -0.522 p = 0.61925
+
+No significant difference anywhere.
+
+###### 5) Treatment effect. 1X vs 1XP
+
+```{r POOLING 1X vs 1XP tests}
+#Remove data that is not relevant
+poolingtest <- subset(alldata, Treatment !="STOCK" & Treatment != "2X" & Sex == "F" & Treatment != "4X")
+
+# Subset to specify comparisons
+
+ #poolingtest <- subset(poolingtest, Host == "BL6F")
+ #poolingtest <- subset(poolingtest, HostStrain == "BALB/C")
+ poolingtest <- subset(poolingtest, Familiarity == "UNF")
+
+#Level on 1X
+
+poolingtest$Treatment <- relevel(factor(poolingtest$Treatment), ref = "1X")
+
+#Scale and center.
+poolingtest$Day <- scale(poolingtest$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.pooling <- lmer(Pct ~ Day * Treatment + Host + (Day||Line/ID), data = poolingtest, REML = TRUE)
+
+# Open the file for writing
+sink("LMM-Tradeoff-1X-vs-1XP_plus_host.txt")
+
+# Output summaries to the file
+summary(model.pooling)
+# Save
+sink()
+
+```
+
+
+```{r 1XP vs combined 1X 2X 4X}
+#Remove data that is not relevant
+poolingtest <- subset(alldata, Treatment !="STOCK" & Sex == "F")
+
+# Subset to specify comparisons
+
+ #poolingtest <- subset(poolingtest, Host == "BL6F")
+ #poolingtest <- subset(poolingtest, HostStrain == "BALB/C")
+ poolingtest <- subset(poolingtest, Familiarity == "UNF")
+
+#Level on 1X
+
+poolingtest$Treatment <- ifelse(poolingtest$Treatment %in% c("1X", "2X", "4X"), "1X2X4X", "1XP")
+
+poolingtest$Treatment <- relevel(factor(poolingtest$Treatment), ref = "1X2X4X")
+
+#Scale and center.
+poolingtest$Day <- scale(poolingtest$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.pooling <- lmer(Pct ~ Day * Treatment + Host + (Day||Line/ID), data = poolingtest, REML = TRUE)
+
+# Open the file for writing
+sink("LMM-Tradeoff-1X2X4X-vs-1XP_plus_host.txt")
+
+# Output summaries to the file
+summary(model.pooling)
+# Save
+sink()
+
+```
+
+What about differences for overall virulence of all treatments, fam and unfam?
+
+```{r OVERALL VIRULENCE DIFFERENCES}
+#Remove data that is not relevant
+poolingtest <- subset(alldata, Treatment !="STOCK" & Sex =="F")
+
+# Subset to specify comparisons
+
+ #poolingtest <- subset(poolingtest, Host == "BL6F")
+ #poolingtest <- subset(poolingtest, HostStrain == "BALB/C")
+ #poolingtest <- subset(poolingtest, Familiarity == "UNF")
+
+#Level on 1X
+
+poolingtest$Treatment <- relevel(factor(poolingtest$Treatment), ref = "1X")
+
+#Scale and center.
+poolingtest$Day <- scale(poolingtest$Day, center = TRUE, scale = TRUE)
+
+#Run model
+model.pooling <- lmer(Pct ~ Day * Treatment + Host + (Day||Line/ID), data = poolingtest, REML = TRUE)
+
+# Open the file for writing
+sink("LMM-ALL_Treatments_in_allHosts_Females_only.txt")
+
+# Output summaries to the file
+summary(model.pooling)
+# Save
+sink()
+
+```
+
