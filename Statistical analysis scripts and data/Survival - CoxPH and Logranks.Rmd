@@ -13,6 +13,7 @@ knitr::opts_chunk$set(echo = TRUE)
 library(lme4)
 library(lmerTest)
 library(survival)
+library(tidyverse)
 ```
 
 Define function for longer pvalue numbers in report
@@ -63,32 +64,30 @@ Logrank for comparisons between unpassaged and passaged. Change hosts as needed.
 ```{r}
 # Subset your data
 survdata3 <- subset(survdata, Treatment!="1XP" & Familiarity=="FAM")
-# Define the host levels and the output file name
 host_levels <- c("BALBF", "BL6F", "BALBM")
-output_file <- "logrank_results_combined.txt"
+output_file <- "logrank_results_by_host.txt"
 
-# Open the output file for writing
 sink(output_file)
 
-# Iterate over the host levels
 for (host in host_levels) {
-  
-  # Create a survival object
-  surv_obj <- Surv(survdata3$TTD, survdata3$Event)
-  
-  # Run the log-rank test
-  logrank_result <- survdiff(surv_obj ~ factor(Status), data = survdata3)
-  
-  # Print the result to the file
+
+  df_host <- subset(survdata3, Host == host)
+
+  surv_obj <- Surv(df_host$TTD, df_host$Event)
+
+  logrank_result <- survdiff(surv_obj ~ factor(Status), data = df_host)
+
   cat("Log-rank test results for Host = ", host, ":\n", sep = "")
   print(logrank_result)
-  cat("\n")
-  
-  # Print detailed p-value
-  cat(pvalue(logrank_result), "\n\n", sep = "")
+
+  # exact-ish p value from chisq
+  p_val <- 1 - pchisq(logrank_result$chisq, df = length(logrank_result$n) - 1)
+  cat("\nChi-squared: ", logrank_result$chisq,
+      "\nDegrees of freedom: ", length(logrank_result$n) - 1,
+      "\nP-value: ", format.pval(p_val, digits = 4, eps = 1e-16),
+      "\n\n", sep = "")
 }
 
-# Close the file
 sink()
 
 ```
@@ -121,188 +120,43 @@ for (host in host_levels) {
 sink()
 ```
 
-___POOLING DIFFERENCES___
-Cox proportional hazards for comparisons between pooling treatments, including host as a fixed effect (but not looking at interactions):
-
+With confidence intervals
 ```{r}
-# Fit a CoxPH model for Treatment only
-survdatafam$Host <- relevel(factor(survdatafam$Host), ref = "BALBF")
-survdatafam$Treatment <- relevel(factor(survdatafam$Treatment), ref = "1X")
-cox_model <- coxph(Surv(TTD, Event) ~ Treatment + Host, data = survdatafam)
+host_levels <- c("BALBF", "BL6F", "BALBM")
+output_file <- "CoxPH_Host_results_with_CI.txt"
 
-# Print the summary of the model to see the results
-summary(cox_model)
+sink(output_file)
 
-# Save to txt (no csv possible)
-sink("CoxPH-Treatment.txt")
-print(cox_model)
-sink()
+for (host in host_levels) {
 
-```
+  # Set reference level without permanently overwriting the column
+  df <- survdatafam
+  df$Host <- relevel(factor(df$Host), ref = host)
 
+  cox_model <- coxph(Surv(TTD, Event) ~ Host, data = df)
+  s <- summary(cox_model)
 
-___Host-adapted virus in FAM and UNFAM___
-Female only
-BALBF-adapted virus (Host) vs BL6F adapted virus, in both hosts.
-```{r}
-# Fit the CoxPH model for the current host level
-survdatatradeoff <- subset(survdata, Sex=="F" & Treatment != "STOCK" & Treatment !="1XP")
+  cat("\n\nCox Proportional Hazards Model (reference = ", host, "):\n", sep = "")
+  cat("n = ", s$n, ", events = ", s$nevent, "\n", sep = "")
 
-survdatatradeoff$Host <- relevel(factor(survdatatradeoff$Host), ref = "BL6F")
+  # Coefficients table (coef, HR, SE, z, p)
+  cat("\nCoefficients:\n")
+  print(s$coefficients)
 
-cox_model <- coxph(Surv(TTD, Event) ~ Host, data = survdatatradeoff)
-  
-sink("CoxPH_Familiar+Unfamiliar_results_combined.txt")
-  
-# Print the result to the file
-cat("Cox Proportional Hazards Model")
-print(cox_model)
+  # HR and 95% CI (plus exp(coef) again)
+  cat("\nHazard ratios and 95% CI:\n")
+  # Columns: exp(coef), exp(-coef), lower .95, upper .95
+  print(s$conf.int)
 
-
-# Close the file
-sink()
-```
-
-Black mice mortality with either virus (fam and unfam) vs balb mortality
-```{r}
-# Fit the CoxPH model for the current host level
-survdatatradeoff <- subset(survdata, Sex=="F" & Treatment != "STOCK" & Treatment !="1XP")
-
-survdatatradeoff$Host <- relevel(factor(survdatatradeoff$HostStrain), ref = "C57BL/6")
-
-cox_model <- coxph(Surv(TTD, Event) ~ HostStrain, data = survdatatradeoff)
-  
-sink("CoxPH_General_Host_Susceptibility_results.txt")
-  
-# Print the result to the file
-cat("Cox Proportional Hazards Model")
-print(cox_model)
-
-
-# Close the file
-sink()
-```
-
-Comparison between host-adapted viruses in fam and unfam.
-BALBF-adapted virus (Host) vs BL6F adapted virus, in both hosts.
-```{r}
-# Remove data that is not relevant
-tradeoffs <- subset(survdata, Treatment != "STOCK" & Treatment != "2X" & Treatment != "1XP" & Sex == "F")
-
-# Create a new column with Status and Host -> Type
-tradeoffs$HostFam <- paste0(tradeoffs$Host,"_",tradeoffs$Familiarity)
-
-# Levels to iterate over
-host_fams <- c("BALBF_FAM", "BALBF_UNF", "BL6F_FAM", "BL6F_UNF")
-
-# Open the file for writing all summaries
-sink("CoxPH-Tradeoffs_1X_4X_only_summary.txt")
-
-# Iterate over each level
-for (level in host_fams) {
-  
-  # Relevel HostFam
-  
-  tradeoffs$HostFam <- relevel(factor(tradeoffs$HostFam), ref = level)
-  
-  # Run model
-
-  model.tradeoffs <- coxph(Surv(TTD, Event) ~ HostFam, data = tradeoffs)
-  
-  # Write the title indicating the level
-  cat("\n\n##############################################\n")
-  cat("            Leveled on", level, "\n")
-  cat("##############################################\n\n")
-  
-  # Output summaries to the file
-  print(summary(model.tradeoffs))
+  # Optional: global tests
+  cat("\nGlobal tests:\n")
+  cat("Likelihood ratio test = ", s$logtest["test"], " on ",
+      s$logtest["df"], " df, p = ", s$logtest["pvalue"], "\n", sep = "")
+  cat("Wald test = ", s$waldtest["test"], " on ",
+      s$waldtest["df"], " df, p = ", s$waldtest["pvalue"], "\n", sep = "")
+  cat("Score (logrank) test = ", s$sctest["test"], " on ",
+      s$sctest["df"], " df, p = ", s$sctest["pvalue"], "\n", sep = "")
 }
 
-# Save and close the file
-sink()
-
-```
-
-
-___1X vs 1XP___
-```{r}
-survdatafem <- subset(survdata, Treatment=="1X" | Treatment=="1XP") #Only 1X and 1XP
-survdatafem <- subset(survdatafem, Sex=="F")
-survdatafemfam <- subset(survdatafem, Familiarity == "FAM")
-```
-
-Does 1XP increase mortality in general?
-```{r}
-# Convert Test to a factor
-survdatafem$Test <- factor(survdatafem$Test)
-
-#Relevel 
-survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
-
-#Run analyses
-survdatafem$TTD
-table(survdatafem$Event,survdatafem$TTD)
-Surv(survdatafem$TTD,survdatafem$Event)
-
-
-
-cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Treatment), data=survdatafem)
-summary(cox)
-
-#Save
-sink("coxph-1XP-female-only.txt")
-print(cox)
 sink()
 ```
-Yes
-
-
-Does 1XP increase mortality in familiar more than unfamiliar?
-```{r}
-# Convert Test to a factor
-survdatafem$Test <- factor(survdatafem$Test)
-
-#Relevel 
-survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
-
-#Run analyses
-survdatafem$TTD
-table(survdatafem$Event,survdatafem$TTD)
-Surv(survdatafem$TTD,survdatafem$Event)
-
-
-
-cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Treatment) * factor(Familiarity), data=survdatafem)
-summary(cox)
-
-sink("coxph-1XP-treatment-familiarity.txt")
-print(cox)
-sink()
-```
-No, but that's because the increase in mortality makes them equal. So it actually negates the tradeoff of the bl6 into balb.
-
-Complete test: separated by host and strain.
-```{r}
-# Convert Test to a factor
-survdatafem$Test <- factor(survdatafem$Test)
-survdatafem$Treatment <- factor(survdatafem$Treatment)
-#Relevel 
-survdatafem$Test <- relevel(survdatafem$Test, ref="BL6F.FAM")
-survdatafem$Treatment <- relevel(survdatafem$Treatment, ref="1X")
-
-#Run analyses
-survdatafem$TTD
-table(survdatafem$Event,survdatafem$TTD)
-Surv(survdatafem$TTD,survdatafem$Event)
-
-
-
-cox <- coxph(Surv(survdatafem$TTD,survdatafem$Event) ~ factor(Test) * factor(Treatment), data=survdatafem)
-summary(cox)
-
-sink("coxph-1XP-test.txt")
-print(cox)
-sink()
-```
-
-This shows that 1XP causes treatments to be similarly high virulence. But not as good test as above.
