@@ -59,6 +59,54 @@ sink()
 
 ```
 
+Uncorrelated day and line slopes
+```{r}
+
+# Subset data
+famtest <- subset(alldata, Familiarity == "FAM" & Treatment != "1XP" )
+
+# Create a scaled Day column without overwriting the original
+famtest$Day_z <- as.numeric(scale(famtest$Day, center = TRUE, scale = TRUE))
+
+hosts <- c("BALBF", "BALBM", "BL6F")
+
+output_file <- "LMM_Results_Host_passaged_vs_unpassaged_refit.txt"
+sink(output_file)
+
+cat("LMM results for passaged vs unpassaged, with Host releveling\n")
+cat("Model: Pct ~ Day_z * Status * Host + random effects\n")
+cat("Unit IDs: ID nested within Line\n\n")
+
+for (host in hosts) {
+
+  # Work on a local copy so you do not mutate famtest across iterations
+  df <- famtest
+  df$Host <- relevel(factor(df$Host), ref = host)
+
+  cat("\n\nResults with Host as reference level: ", host, "\n", sep = "")
+  cat("---------------------------------------------------\n")
+
+  # Model 1: correlated random intercept/slope (may be singular)
+  m_corr <- lmer(Pct ~ Day_z * Status * Host + (Day_z | Line/ID),
+                 data = df, REML = TRUE)
+
+  cat("\nModel with correlated random effects: (Day_z | Line/ID)\n")
+  cat("isSingular: ", isSingular(m_corr), "\n", sep = "")
+  cat("AIC: ", AIC(m_corr), "\n", sep = "")
+  print(summary(m_corr))
+
+  # Model 2: uncorrelated random intercept/slope (often resolves singularity)
+  m_uncorr <- lmer(Pct ~ Day_z * Status * Host + (Day_z || Line/ID),
+                   data = df, REML = TRUE)
+
+  cat("\nModel with uncorrelated random effects: (Day_z || Line/ID)\n")
+  cat("isSingular: ", isSingular(m_uncorr), "\n", sep = "")
+  cat("AIC: ", AIC(m_uncorr), "\n", sep = "")
+  print(summary(m_uncorr))
+}
+
+sink()
+```
 
 
 For general virulence for each adapted strain, we will go with effect of Host only as there is no effect of treatment, so we keep the model simple.
@@ -97,6 +145,40 @@ for (host in hosts) {
 # Close the connection
 sink()
 
+```
+
+Uncorrelated!
+
+```{r}
+# Create scaled Day as a numeric column (do not overwrite original Day)
+famtest$Day_z <- as.numeric(scale(famtest$Day, center = TRUE, scale = TRUE))
+
+hosts <- c("BALBF", "BALBM", "BL6F")
+
+output_file <- "LMM_Results_Host_Differences_uncorr.txt"
+sink(output_file)
+
+cat("LMM results for weight loss comparisons between hosts\n")
+cat("Model: Pct ~ Day_z * Host + (Day_z || Line/ID)\n")
+cat("Random effects: uncorrelated random intercepts and slopes for Day_z\n")
+cat("DF: Satterthwaite (lmerTest)\n\n")
+
+for (host in hosts) {
+
+  # Use a local copy so you do not mutate famtest across iterations
+  df <- famtest
+  df$Host <- relevel(factor(df$Host), ref = host)
+
+  model <- lmer(Pct ~ Day_z * Host + (Day_z || Line/ID),
+                data = df, REML = TRUE)
+
+  cat("\n\nResults with Host as reference level: ", host, "\n", sep = "")
+  cat("---------------------------------------------------\n")
+  cat("isSingular: ", isSingular(model), "\n", sep = "")
+  print(summary(model))
+}
+
+sink()
 ```
 
 
